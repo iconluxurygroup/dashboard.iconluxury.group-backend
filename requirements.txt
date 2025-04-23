@@ -1,0 +1,10 @@
+fastapi
+pydantic
+pyodbc
+pandas
+openpyxl
+boto3
+uvicorn
+python-multipart
+openpyxl-image-loader
+requests

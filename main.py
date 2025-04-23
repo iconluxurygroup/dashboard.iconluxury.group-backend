@@ -1,0 +1,671 @@
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from typing import List, Dict, Optional
+from fastapi import FastAPI, UploadFile, Form, HTTPException
+import pyodbc
+import uuid
+import os
+import re
+import pandas as pd
+import shutil
+from openpyxl import load_workbook
+from openpyxl_image_loader import SheetImageLoader
+import boto3
+import requests
+import json
+import logging
+
+app = FastAPI()
+# Lightweight job model for initial list
+class JobSummary(BaseModel):
+    id: int
+    inputFile: str
+    fileEnd: str | None
+    user: str
+    rec: int
+    img: int
+
+# Full job details model
+class ResultItem(BaseModel):
+    resultId: int
+    entryId: int
+    imageUrl: str
+    imageDesc: str | None
+    imageSource: str | None
+    createTime: str | None
+    imageUrlThumbnail: str | None
+    sortOrder: int
+    imageIsFashion: int
+    aiCaption: str | None
+    aiJson: str | None
+    aiLabel: str | None
+
+class RecordItem(BaseModel):
+    entryId: int
+    fileId: int
+    excelRowId: int
+    productModel: str | None
+    productBrand: str | None
+    createTime: str | None
+    step1: str | None
+    step2: str | None
+    step3: str | None
+    step4: str | None
+    completeTime: str | None
+    productColor: str | None
+    productCategory: str | None
+    excelRowImageRef: str | None; 
+
+class JobDetails(BaseModel):
+    id: int
+    inputFile: str
+    imageStart: str | None
+    fileStart: str | None
+    fileEnd: str | None
+    resultFile: str | None
+    fileLocationUrl: str | None
+    logFileUrl: str | None
+    user: str
+    rec: int
+    img: int
+    apiUsed: str
+    imageEnd: str | None
+    results: list[ResultItem]
+    records: list[RecordItem]
+
+# Model for domain aggregation (matches React's DomainAggregation)
+class DomainAggregation(BaseModel):
+    domain: str
+    totalResults: int
+    positiveSortOrderCount: int
+
+# CORS middleware to allow requests from your frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust to specific origins (e.g., "http://localhost:3000") in production
+    allow_credentials=True,
+    allow_methods=["GET", "OPTIONS", "POST"],
+    allow_headers=["*"],
+)
+
+# MSSQL connection settings
+DB_CONFIG = {
+    "server": "35.172.243.170",
+    "database": "luxurymarket_p4",
+    "username": "luxurysitescraper",
+    "password": "Ftu5675FDG54hjhiuu$",
+    "driver": "{ODBC Driver 17 for SQL Server}",
+}
+
+# AWS S3 configuration (optional, adjust as needed)
+S3_CONFIG = {
+    "endpoint": "https://s3.us-east-2.amazonaws.com",  # e.g., "https://nyc3.digitaloceanspaces.com"
+    "region": "us-east-2",  # e.g., "us-east-1"
+    "access_key": "AKIA2CUNLEV6V627SWI7",
+    "secret_key": "QGwMNj0O0ChVEpxiEEyKu3Ye63R+58ql3iSFvHfs",
+    "bucket_name": "iconluxurygroup",
+}
+
+# New model for reference data
+class ReferenceData(BaseModel):
+    data: Dict[str, str]
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+default_logger = logging.getLogger(__name__)
+
+# Database connection function
+def get_db_connection():
+    conn_str = (
+        f"DRIVER={DB_CONFIG['driver']};"
+        f"SERVER={DB_CONFIG['server']};"
+        f"DATABASE={DB_CONFIG['database']};"
+        f"UID={DB_CONFIG['username']};"
+        f"PWD={DB_CONFIG['password']}"
+    )
+    return pyodbc.connect(conn_str)
+
+# S3 client setup (optional)
+s3_client = boto3.client(
+    "s3",
+    region_name=S3_CONFIG["region"],
+    endpoint_url=S3_CONFIG["endpoint"],
+    aws_access_key_id=S3_CONFIG["access_key"],
+    aws_secret_access_key=S3_CONFIG["secret_key"],
+)
+import mimetypes
+def upload_to_s3(local_file_path, bucket_name, s3_key):
+    try:
+        content_type, _ = mimetypes.guess_type(local_file_path)
+        if not content_type:
+            content_type = 'application/octet-stream'
+            default_logger.warning(f"Could not determine Content-Type for {local_file_path}")
+        s3_client.upload_file(
+            local_file_path,
+            bucket_name,
+            s3_key,
+            ExtraArgs={
+                'ACL': 'public-read',
+                'ContentType': content_type
+            }
+        )
+        s3_url = f"{S3_CONFIG['endpoint']}/{bucket_name}/{s3_key}"
+        default_logger.info(f"Uploaded {local_file_path} to S3: {s3_url} with Content-Type: {content_type}")
+        return s3_url
+    except Exception as e:
+        default_logger.error(f"Failed to upload_column_mapload_column_map {local_file_path} to S3: {e}")
+        raise
+
+def validate_column(col: str) -> str:
+    if not col or not re.match(r"^[A-Z]+$", col):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid column name: {col}. Must be uppercase letters only (e.g., 'A', 'B', 'AA')."
+        )
+    return col
+def load_payload_db(rows, file_id, column_map, logger=None):
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        with get_db_connection() as connection:
+            cursor = connection.cursor()
+            cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
+            if cursor.fetchone()[0] == 0:
+                raise ValueError(f"FileID {file_id} does not exist in utb_ImageScraperFiles")
+
+            df = pd.DataFrame(rows)
+            logger.debug(f"Raw DataFrame (rows={len(df)}): {df.to_dict(orient='records')}")
+
+            # Rename columns to match database fields
+            rename_dict = {
+                'search': 'ProductModel',
+                'brand': 'ProductBrand',
+                'color': 'ProductColor',
+                'category': 'ProductCategory',
+                'ExcelRowImageRef': 'ExcelRowImageRef'
+            }
+            df = df.rename(columns=rename_dict)
+            logger.debug(f"DataFrame after renaming: {df.to_dict(orient='records')}")
+
+            # Apply manual brand if specified
+            if column_map['brand'] == 'MANUAL':
+                manual_brand_value = column_map.get('manualBrand', '')
+                if not manual_brand_value:
+                    logger.warning("brandColImage is 'MANUAL' but manualBrand is empty or None")
+                df['ProductBrand'] = manual_brand_value
+                logger.debug(f"Applied manual brand: '{manual_brand_value}' to all rows")
+
+            # Add required columns
+            df['FileID'] = file_id
+            df['ExcelRowID'] = range(1, len(df) + 1)
+
+            logger.debug(f"DataFrame after adding FileID and ExcelRowID: {df.to_dict(orient='records')}")
+
+            # Define expected columns
+            expected_cols = ['FileID', 'ExcelRowID', 'ProductModel', 'ProductBrand', 'ProductColor', 'ProductCategory', 'ExcelRowImageRef']
+
+            # Ensure all expected columns exist
+            for col in expected_cols:
+                if col not in df.columns:
+                    df[col] = None
+                df[col] = df[col].where(df[col].notna(), None)
+
+            logger.debug(f"Final DataFrame before DB insert: {df.head().to_dict(orient='records')}")
+
+            # Insert rows
+            rows_inserted = 0
+            for idx, row in df.iterrows():
+                try:
+                    row_values = [row.get(col, None) for col in expected_cols]
+                    cursor.execute(
+                        f"INSERT INTO utb_ImageScraperRecords ({', '.join(expected_cols)}) VALUES ({', '.join(['?'] * len(expected_cols))})",
+                        tuple(row_values)
+                    )
+                    rows_inserted += 1
+                except Exception as e:
+                    logger.error(f"Error inserting row {idx + 1}: {e}")
+
+            connection.commit()
+            logger.info(f"Committed {rows_inserted} rows into utb_ImageScraperRecords for FileID: {file_id}")
+
+            # Verify insertion
+            cursor.execute(
+                "SELECT FileID, ExcelRowID, ProductModel, ProductBrand, ProductColor, ProductCategory, ExcelRowImageRef "
+                "FROM utb_ImageScraperRecords WHERE FileID = ? ORDER BY ExcelRowID",
+                (file_id,)
+            )
+            inserted_rows = cursor.fetchall()
+            logger.debug(f"All data from DB for FileID {file_id}: {inserted_rows}")
+
+        logger.info(f"Loaded {len(df)} rows into utb_ImageScraperRecords for FileID: {file_id}")
+        return df
+    except Exception as e:
+        logger.error(f"Error loading payload data: {e}")
+        raise
+# Insert file metadata into database
+def insert_file_db(filename: str, file_url: str, email: Optional[str], header_index: int, logger=None) -> int:
+    logger = logger or default_logger
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        query = """
+            INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl, UserEmail, UserHeaderIndex, CreateFileStartTime)
+            OUTPUT INSERTED.ID
+            VALUES (?, ?, ?, ?, GETDATE())
+        """
+        cursor.execute(query, (filename, file_url, email or 'nik@accessx.com', str(header_index)))
+        row = cursor.fetchone()
+        if row is None or row[0] is None:
+            raise Exception("Insert failed or no identity value returned.")
+        file_id = int(row[0])
+        conn.commit()
+        conn.close()
+        logger.info(f"Inserted file record with ID: {file_id} and header_index: {header_index}")
+        return file_id
+    except pyodbc.Error as e:
+        logger.error(f"Database error: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Error in insert_file_db: {e}")
+        raise
+
+@app.post("/submitImage")
+async def submit_image(
+    fileUploadImage: UploadFile,
+    header_index: int = Form(...),
+    imageColumnImage: Optional[str] = Form(None),
+    searchColImage: str = Form(...),
+    brandColImage: str = Form(...),
+    ColorColImage: Optional[str] = Form(None),
+    CategoryColImage: Optional[str] = Form(None),
+    sendToEmail: Optional[str] = Form(None),
+    manualBrand: Optional[str] = Form(None),
+):
+    temp_dir = None
+    extracted_images_dir = None
+    try:
+        file_id = str(uuid.uuid4())
+        default_logger.info(f"Processing file for FileID: {file_id}")
+        default_logger.info(f"Received: brandColImage={brandColImage}, manualBrand={manualBrand}, "
+                           f"searchColImage={searchColImage}, imageColumnImage={imageColumnImage}, "
+                           f"ColorColImage={ColorColImage}, CategoryColImage={CategoryColImage}, "
+                           f"header_index={header_index}")
+
+        if header_index < 1:
+            raise HTTPException(status_code=400, detail="header_index must be 1 or greater (1-based row number)")
+
+        temp_dir = os.path.join("temp_files", "images", file_id)
+        os.makedirs(temp_dir, exist_ok=True)
+        uploaded_file_path = os.path.join(temp_dir, fileUploadImage.filename)
+        with open(uploaded_file_path, "wb") as buffer:
+            shutil.copyfileobj(fileUploadImage.file, buffer)
+
+        s3_key_excel = f"uploads/{file_id}/{fileUploadImage.filename}"
+        file_url = upload_to_s3(uploaded_file_path, S3_CONFIG['bucket_name'], s3_key_excel)
+
+        extract_column_map = {
+            'brand': 'MANUAL' if brandColImage == 'MANUAL' else validate_column(brandColImage),
+            'style': validate_column(searchColImage),
+            'image': validate_column(imageColumnImage) if imageColumnImage else None,
+            'color': validate_column(ColorColImage) if ColorColImage else None,
+            'category': validate_column(CategoryColImage) if CategoryColImage else None,
+            'manualBrand': manualBrand
+        }
+        default_logger.info(f"Column map: {extract_column_map}")
+
+        if extract_column_map['brand'] == 'MANUAL' and not manualBrand:
+            raise HTTPException(status_code=400, detail="manualBrand is required when brandColImage is 'MANUAL'")
+
+        extracted_data, extracted_images_dir = extract_data_and_images(
+            uploaded_file_path, file_id, extract_column_map, header_index,
+            manualBrand if extract_column_map['brand'] == 'MANUAL' else None
+        )
+        default_logger.debug(f"Extracted data: {extracted_data}")
+        default_logger.info(f"Extracted for email: {sendToEmail}")
+
+        file_id_db = insert_file_db(fileUploadImage.filename, file_url, sendToEmail, header_index, default_logger)
+
+        load_payload_db(extracted_data, file_id_db, extract_column_map, default_logger)
+
+        return {
+            "success": True,
+            "fileUrl": file_url,
+            "message": "File uploaded and processed successfully",
+            "file_id": file_id_db,
+        }
+    except Exception as e:
+        default_logger.error(f"Error processing file: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+    finally:
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        if extracted_images_dir and os.path.exists(extracted_images_dir):
+            shutil.rmtree(extracted_images_dir, ignore_errors=True)
+from typing import Optional, Dict, List, Tuple
+
+def extract_data_and_images(
+    file_path: str, 
+    file_id: str, 
+    column_map: Dict[str, str], 
+    header_row: int, 
+    manualBrand: Optional[str] = None
+) -> Tuple[List[Dict], Optional[str]]:
+    wb = load_workbook(file_path)
+    sheet = wb.active
+    image_loader = SheetImageLoader(sheet) if column_map.get('image') else None
+
+    extracted_images_dir = None
+    if column_map.get('image'):
+        extracted_images_dir = os.path.join("temp_files", "extracted_images", file_id)
+        os.makedirs(extracted_images_dir, exist_ok=True)
+
+    # Header row index (1-based in Excel, so header_row + 1)
+    header_idx = header_row 
+
+    # Extract header data for logging/validation only, not for payload
+    header_data = {
+        'search': sheet[f'{column_map["style"]}{header_idx}'].value if column_map.get('style') else None,
+        'brand': manualBrand if column_map.get('brand') == 'MANUAL' else (
+            sheet[f'{column_map["brand"]}{header_idx}'].value if column_map.get('brand') else None
+        ),
+        'color': sheet[f'{column_map["color"]}{header_idx}'].value if column_map.get('color') else None,
+        'category': sheet[f'{column_map["category"]}{header_idx}'].value if column_map.get('category') else None,
+    }
+    default_logger.info(f"Header row {header_idx}: {header_data}")
+
+    # Extract data rows starting AFTER the header row
+    extracted_data = []
+    for row_idx in range(header_row + 2, sheet.max_row + 1):  # Start from header_row + 2 to skip header
+        image_ref = None
+        if column_map.get('image'):
+            image_cell = f'{column_map["image"]}{row_idx}'
+            image_ref = sheet[image_cell].value if sheet[image_cell] else None
+
+        if column_map['brand'] == 'MANUAL':
+            brand = manualBrand
+            default_logger.debug(f"Using manual brand: {brand} for row {row_idx}")
+        else:
+            brand = (
+                sheet[f'{column_map["brand"]}{row_idx}'].value 
+                if column_map.get('brand') and sheet[f'{column_map["brand"]}{row_idx}'] 
+                else None
+            )
+
+        data = {
+            'search': (
+                sheet[f'{column_map["style"]}{row_idx}'].value 
+                if column_map.get('style') and sheet[f'{column_map["style"]}{row_idx}'] 
+                else None
+            ),
+            'brand': brand,
+            'ExcelRowImageRef': image_ref,
+            'color': (
+                sheet[f'{column_map["color"]}{row_idx}'].value 
+                if column_map.get('color') and sheet[f'{column_map["color"]}{row_idx}'] 
+                else None
+            ),
+            'category': (
+                sheet[f'{column_map["category"]}{row_idx}'].value 
+                if column_map.get('category') and sheet[f'{column_map["category"]}{row_idx}'] 
+                else None
+            ),
+        }
+
+        if column_map.get('image') and not data['ExcelRowImageRef'] and image_loader and image_loader.image_in(image_cell):
+            img_path = os.path.join(extracted_images_dir, f"image_{file_id}_{image_cell}.png")
+            image = image_loader.get(image_cell)
+            if image:
+                image.save(img_path)
+                s3_key = f"images/{file_id}/{os.path.basename(img_path)}"
+                s3_url = upload_to_s3(img_path, S3_CONFIG['bucket_name'], s3_key)
+                data['ExcelRowImageRef'] = s3_url
+                default_logger.info(f"Extracted and uploaded image from {image_cell} to {s3_url}")
+            else:
+                default_logger.warning(f"No image retrieved from cell {image_cell}")
+
+        default_logger.info(f"Extracted data for row {row_idx - header_row - 1}: {data}")
+        extracted_data.append(data)
+
+    default_logger.info(f"Total rows extracted (excluding header): {len(extracted_data)}")
+
+    return extracted_data, extracted_images_dir
+# New endpoint for updating references
+@app.api_route("/api/update-references", methods=["GET", "POST"], response_model=ReferenceData)
+async def update_references(updated_data: Optional[ReferenceData] = None):
+    github_url = "https://raw.githubusercontent.com/iconluxurygroup/settings-static-data/refs/heads/main/optimal-references.json"
+    s3_key = "optimal-references.json"
+
+    if updated_data is None:  # GET request
+        try:
+            response = requests.get(github_url)
+            if response.status_code != 200:
+                raise HTTPException(status_code=500, detail="Failed to fetch data from GitHub")
+            data = response.json()
+            return ReferenceData(data=data)
+        except Exception as e:
+            default_logger.error(f"Error fetching from GitHub: {e}")
+            raise HTTPException(status_code=500, detail=f"Error fetching data: {str(e)}")
+
+    else:  # POST request
+        try:
+            # Validate data
+            if not updated_data.data:
+                raise HTTPException(status_code=400, detail="Data cannot be empty")
+            if len(updated_data.data) != len(set(updated_data.data.keys())):
+                raise HTTPException(status_code=400, detail="Duplicate categories are not allowed")
+            if any(not key or not value for key, value in updated_data.data.items()):
+                raise HTTPException(status_code=400, detail="All fields must be non-empty")
+
+            # Save to temporary file
+            temp_file = "temp_references.json"
+            with open(temp_file, "w") as f:
+                json.dump(updated_data.data, f)
+
+            # Upload to S3
+            s3_client.upload_file(
+                temp_file,
+                S3_CONFIG["bucket_name"],
+                s3_key,
+                ExtraArgs={
+                    "ACL": "public-read",
+                    "ContentType": "application/json"
+                }
+            )
+            s3_url = f"{S3_CONFIG['endpoint']}/{S3_CONFIG['bucket_name']}/{s3_key}"
+            default_logger.info(f"Uploaded updated references to S3: {s3_url}")
+
+            # Clean up
+            os.remove(temp_file)
+
+            return ReferenceData(data=updated_data.data)
+        except Exception as e:
+            default_logger.error(f"Error uploading to S3: {e}")
+            raise HTTPException(status_code=500, detail=f"Error saving data: {str(e)}")
+
+@app.get("/api/scraping-jobs", response_model=list[JobSummary])
+async def get_all_jobs(page: int = 1, page_size: int = 10):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        offset = (page - 1) * page_size
+
+        query = """
+            SELECT 
+                ID, 
+                FileName, 
+                CreateFileCompleteTime, 
+                UserEmail,
+                (SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = utb_ImageScraperFiles.ID) as rec_count,
+                (SELECT COUNT(*) FROM utb_ImageScraperResult 
+                 WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = utb_ImageScraperFiles.ID)) as img_count
+            FROM utb_ImageScraperFiles
+            ORDER BY ID DESC
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        """
+        cursor.execute(query, (offset, page_size))
+        rows = cursor.fetchall()
+
+        jobs_data = [
+            {
+                "id": row.ID,
+                "inputFile": row.FileName,
+                "fileEnd": row.CreateFileCompleteTime.isoformat() if row.CreateFileCompleteTime else None,
+                "user": row.UserEmail or "Unknown",
+                "rec": row.rec_count,
+                "img": row.img_count,
+            }
+            for row in rows
+        ]
+
+        conn.close()
+        return jobs_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Detailed job endpoint (unchanged)
+@app.get("/api/scraping-jobs/{job_id}", response_model=JobDetails)
+async def get_job(job_id: int):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        query_files = """
+            SELECT ID, FileName, ImageStartTime, CreateFileStartTime, CreateFileCompleteTime,
+                   FileLocationURLComplete AS ResultFile, FileLocationUrl, LogFileURL, UserEmail,
+                   ImageCompleteTime
+            FROM utb_ImageScraperFiles
+            WHERE ID = ?
+        """
+        cursor.execute(query_files, (job_id,))
+        row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        query_results = """
+            SELECT ResultID, EntryID, ImageUrl, ImageDesc, ImageSource, CreateTime, ImageUrlThumbnail,
+                   SortOrder, ImageIsFashion, AiCaption, AiJson, AiLabel
+            FROM utb_ImageScraperResult
+            WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?)
+        """
+        cursor.execute(query_results, (job_id,))
+        results = cursor.fetchall()
+
+        query_records = """
+            SELECT EntryID, FileID, ExcelRowID, ProductModel, ProductBrand, CreateTime, Step1, Step2, 
+                   Step3, Step4, CompleteTime, ProductColor, ProductCategory,excelRowImageRef
+            FROM utb_ImageScraperRecords
+            WHERE FileID = ?
+        """
+        cursor.execute(query_records, (job_id,))
+        records = cursor.fetchall()
+
+        job_data = {
+            "id": row.ID,
+            "inputFile": row.FileName,
+            "imageStart": row.ImageStartTime.isoformat() if row.ImageStartTime else None,
+            "fileStart": row.CreateFileStartTime.isoformat() if row.CreateFileStartTime else None,
+            "fileEnd": row.CreateFileCompleteTime.isoformat() if row.CreateFileCompleteTime else None,
+            "resultFile": row.ResultFile,
+            "fileLocationUrl": row.FileLocationUrl,
+            "logFileUrl": row.LogFileURL,
+            "user": row.UserEmail or "Unknown",
+            "rec": len(records),
+            "img": len(results),
+            "apiUsed": "google-serp",
+            "imageEnd": row.ImageCompleteTime.isoformat() if row.ImageCompleteTime else None,
+            "results": [
+                {
+                    "resultId": r.ResultID,
+                    "entryId": r.EntryID,
+                    "imageUrl": r.ImageUrl or "None",
+                    "imageDesc": r.ImageDesc,
+                    "imageSource": r.ImageSource,
+                    "createTime": r.CreateTime.isoformat() if r.CreateTime else None,
+                    "imageUrlThumbnail": r.ImageUrlThumbnail or "None",
+                    "sortOrder": r.SortOrder or -1,
+                    "imageIsFashion": r.ImageIsFashion,
+                    "aiCaption": r.AiCaption,
+                    "aiJson": r.AiJson,
+                    "aiLabel": r.AiLabel,
+                } for r in results
+            ],
+            "records": [
+                {
+                    "entryId": r.EntryID,
+                    "fileId": r.FileID,
+                    "excelRowId": r.ExcelRowID,
+                    "productModel": r.ProductModel,
+                    "productBrand": r.ProductBrand,
+                    "createTime": r.CreateTime.isoformat() if r.CreateTime else None,
+                    "step1": r.Step1.isoformat() if r.Step1 else None,
+                    "step2": r.Step2.isoformat() if r.Step1 else None,
+                    "step3": r.Step3.isoformat() if r.Step1 else None,
+                    "step4": r.Step4.isoformat() if r.Step1 else None,
+                    "completeTime": r.CompleteTime.isoformat() if r.CompleteTime else None,
+                    "productColor": r.ProductColor if r.ProductColor else None,
+                    "productCategory": r.ProductCategory if r.ProductCategory else None,
+                    "excelRowImageRef":r.excelRowImageRef if r.excelRowImageRef else None,
+                } for r in records
+            ],
+        }
+
+        conn.close()
+        return job_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# New endpoint to aggregate all results by domain
+@app.get("/api/whitelist-domains", response_model=List[DomainAggregation])
+async def get_whitelist_domains():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Fetch all results from utb_ImageScraperResult
+        query = """
+            SELECT ImageSource, SortOrder
+            FROM utb_ImageScraperResult
+        """
+        cursor.execute(query)
+        rows = cursor.fetchall()
+
+        # Aggregate by domain
+        domain_data = {}
+        for row in rows:
+            image_source = row.ImageSource if row.ImageSource else "unknown"
+            sort_order = row.SortOrder if row.SortOrder is not None else -1
+
+            # Extract domain from ImageSource URL
+            try:
+                from urllib.parse import urlparse
+                domain = urlparse(image_source).hostname or "unknown"
+                domain = domain.replace("www.", "")  # Remove "www." prefix
+            except:
+                domain = "unknown"
+
+            if domain not in domain_data:
+                domain_data[domain] = {"totalResults": 0, "positiveSortOrderCount": 0}
+            
+            domain_data[domain]["totalResults"] += 1
+            if sort_order > 0:
+                domain_data[domain]["positiveSortOrderCount"] += 1
+
+        # Convert to list for response
+        aggregated_domains = [
+            {
+                "domain": domain,
+                "totalResults": data["totalResults"],
+                "positiveSortOrderCount": data["positiveSortOrderCount"],
+            }
+            for domain, data in domain_data.items()
+        ]
+
+        conn.close()
+        return aggregated_domains
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
