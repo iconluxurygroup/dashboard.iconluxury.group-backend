@@ -139,8 +139,6 @@ def get_db_connection():
 def get_s3_client(service='s3', logger=None, file_id=None):
     logger = logger or default_logger
     if logger == default_logger and file_id:
-        from logging_config import setup_job_logger
-        logger, _ = setup_job_logger(job_id=file_id, console_output=True)
         logger.info(f"Setup logger for get_s3_client, FileID: {file_id}")
     
     try:
@@ -178,8 +176,6 @@ def double_encode_plus(filename, logger=None):
 def upload_to_s3(local_file_path, bucket_name, s3_key, r2_bucket_name=None, logger=None, file_id=None):
     logger = logger or default_logger
     if logger == default_logger and file_id:
-        from logging_config import setup_job_logger
-        logger, _ = setup_job_logger(job_id=file_id, console_output=True)
         logger.info(f"Setup logger for upload_to_s3, FileID: {file_id}")
     
     result_urls = {}
