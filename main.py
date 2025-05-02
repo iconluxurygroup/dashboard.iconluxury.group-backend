@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from fastapi import FastAPI, UploadFile, Form, HTTPException
 import pyodbc
 import uuid
@@ -14,8 +14,12 @@ import boto3
 import requests
 import json
 import logging
+import urllib.parse
+import mimetypes
 
-app = FastAPI()
+# Initialize FastAPI app
+app = FastAPI(title="iconluxury.group backend", version="2.0.0")
+
 # Lightweight job model for initial list
 class JobSummary(BaseModel):
     id: int
@@ -54,7 +58,7 @@ class RecordItem(BaseModel):
     completeTime: str | None
     productColor: str | None
     productCategory: str | None
-    excelRowImageRef: str | None; 
+    excelRowImageRef: str | None
 
 class JobDetails(BaseModel):
     id: int
@@ -73,16 +77,20 @@ class JobDetails(BaseModel):
     results: list[ResultItem]
     records: list[RecordItem]
 
-# Model for domain aggregation (matches React's DomainAggregation)
+# Model for domain aggregation
 class DomainAggregation(BaseModel):
     domain: str
     totalResults: int
     positiveSortOrderCount: int
 
-# CORS middleware to allow requests from your frontend
+# Model for reference data
+class ReferenceData(BaseModel):
+    data: Dict[str, str]
+
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust to specific origins (e.g., "http://localhost:3000") in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["GET", "OPTIONS", "POST"],
     allow_headers=["*"],
@@ -97,18 +105,21 @@ DB_CONFIG = {
     "driver": "{ODBC Driver 17 for SQL Server}",
 }
 
-# AWS S3 configuration (optional, adjust as needed)
+# AWS S3 and Cloudflare R2 configuration
 S3_CONFIG = {
-    "endpoint": "https://s3.us-east-2.amazonaws.com",  # e.g., "https://nyc3.digitaloceanspaces.com"
-    "region": "us-east-2",  # e.g., "us-east-1"
+    "endpoint": "https://s3.us-east-2.amazonaws.com",
+    "region": "us-east-2",
     "access_key": "AKIA2CUNLEV6V627SWI7",
     "secret_key": "QGwMNj0O0ChVEpxiEEyKu3Ye63R+58ql3iSFvHfs",
     "bucket_name": "iconluxurygroup",
+    "r2_endpoint": "https://aa2f6aae69e7fb4bd8e2cd4311c411cb.r2.cloudflarestorage.com",
+    "r2_access_key": "8b5a4a988c474205e0172eab5479d6f2",
+    "r2_secret_key": "8ff719bbf2946c1b6a81fcf2121e1a41604a0b6f2890f308871b381e98a8d725",
+    "r2_account_id": "aa2f6aae69e7fb4bd8e2cd4311c411cb",
+    "r2_bucket_name": "iconluxurygroup",
+    "r2_custom_domain": "https://iconluxury.group",
 }
 
-# New model for reference data
-class ReferenceData(BaseModel):
-    data: Dict[str, str]
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 default_logger = logging.getLogger(__name__)
@@ -124,21 +135,65 @@ def get_db_connection():
     )
     return pyodbc.connect(conn_str)
 
-# S3 client setup (optional)
-s3_client = boto3.client(
-    "s3",
-    region_name=S3_CONFIG["region"],
-    endpoint_url=S3_CONFIG["endpoint"],
-    aws_access_key_id=S3_CONFIG["access_key"],
-    aws_secret_access_key=S3_CONFIG["secret_key"],
-)
-import mimetypes
-def upload_to_s3(local_file_path, bucket_name, s3_key):
+# S3 and R2 upload function
+def get_s3_client(service='s3', logger=None, file_id=None):
+    logger = logger or default_logger
+    if logger == default_logger and file_id:
+        from logging_config import setup_job_logger
+        logger, _ = setup_job_logger(job_id=file_id, console_output=True)
+        logger.info(f"Setup logger for get_s3_client, FileID: {file_id}")
+    
     try:
-        content_type, _ = mimetypes.guess_type(local_file_path)
-        if not content_type:
-            content_type = 'application/octet-stream'
-            default_logger.warning(f"Could not determine Content-Type for {local_file_path}")
+        logger.info(f"Creating {service.upper()} client")
+        if service == 'r2':
+            client = boto3.client(
+                "s3",
+                region_name='auto',
+                endpoint_url=S3_CONFIG['r2_endpoint'],
+                aws_access_key_id=S3_CONFIG['r2_access_key'],
+                aws_secret_access_key=S3_CONFIG['r2_secret_key']
+            )
+        else:
+            client = boto3.client(
+                "s3",
+                region_name=S3_CONFIG['region'],
+                endpoint_url=S3_CONFIG['endpoint'],
+                aws_access_key_id=S3_CONFIG['access_key'],
+                aws_secret_access_key=S3_CONFIG['secret_key']
+            )
+        logger.info(f"{service.upper()} client created successfully")
+        return client
+    except Exception as e:
+        logger.error(f"Error creating {service.upper()} client: {e}", exc_info=True)
+        raise
+
+def double_encode_plus(filename, logger=None):
+    logger = logger or default_logger
+    logger.debug(f"Encoding filename: {filename}")
+    first_pass = filename.replace('+', '%2B')
+    second_pass = urllib.parse.quote(first_pass)
+    logger.debug(f"Double-encoded filename: {second_pass}")
+    return second_pass
+
+def upload_to_s3(local_file_path, bucket_name, s3_key, r2_bucket_name=None, logger=None, file_id=None):
+    logger = logger or default_logger
+    if logger == default_logger and file_id:
+        from logging_config import setup_job_logger
+        logger, _ = setup_job_logger(job_id=file_id, console_output=True)
+        logger.info(f"Setup logger for upload_to_s3, FileID: {file_id}")
+    
+    result_urls = {}
+    
+    # Determine Content-Type
+    content_type, _ = mimetypes.guess_type(local_file_path)
+    if not content_type:
+        content_type = 'application/octet-stream'
+        logger.warning(f"Could not determine Content-Type for {local_file_path}")
+    
+    # Upload to AWS S3
+    try:
+        s3_client = get_s3_client(service='s3', logger=logger, file_id=file_id)
+        logger.info(f"Uploading {local_file_path} to S3: {bucket_name}/{s3_key}")
         s3_client.upload_file(
             local_file_path,
             bucket_name,
@@ -148,12 +203,37 @@ def upload_to_s3(local_file_path, bucket_name, s3_key):
                 'ContentType': content_type
             }
         )
-        s3_url = f"{S3_CONFIG['endpoint']}/{bucket_name}/{s3_key}"
-        default_logger.info(f"Uploaded {local_file_path} to S3: {s3_url} with Content-Type: {content_type}")
-        return s3_url
+        double_encoded_key = double_encode_plus(s3_key, logger=logger)
+        s3_url = f"https://{bucket_name}.s3.{S3_CONFIG['region']}.amazonaws.com/{double_encoded_key}"
+        logger.info(f"Uploaded {local_file_path} to S3: {s3_url} with Content-Type: {content_type}")
+        result_urls['s3'] = s3_url
     except Exception as e:
-        default_logger.error(f"Failed to upload_column_mapload_column_map {local_file_path} to S3: {e}")
+        logger.error(f"Failed to upload {local_file_path} to S3: {e}")
         raise
+    
+    # Upload to Cloudflare R2 (if r2_bucket_name is provided)
+    if r2_bucket_name:
+        try:
+            r2_client = get_s3_client(service='r2', logger=logger, file_id=file_id)
+            logger.info(f"Uploading {local_file_path} to R2: {r2_bucket_name}/{s3_key}")
+            r2_client.upload_file(
+                local_file_path,
+                r2_bucket_name,
+                s3_key,
+                ExtraArgs={
+                    'ACL': 'public-read',
+                    'ContentType': content_type
+                }
+            )
+            double_encoded_key = double_encode_plus(s3_key, logger=logger)
+            r2_url = f"{S3_CONFIG['r2_custom_domain']}/{double_encoded_key}"
+            logger.info(f"Uploaded {local_file_path} to R2: {r2_url} with Content-Type: {content_type}")
+            result_urls['r2'] = r2_url
+        except Exception as e:
+            logger.error(f"Failed to upload {local_file_path} to R2: {e}")
+            raise
+    
+    return result_urls
 
 def validate_column(col: str) -> str:
     if not col or not re.match(r"^[A-Z]+$", col):
@@ -162,6 +242,7 @@ def validate_column(col: str) -> str:
             detail=f"Invalid column name: {col}. Must be uppercase letters only (e.g., 'A', 'B', 'AA')."
         )
     return col
+
 def load_payload_db(rows, file_id, column_map, logger=None):
     logger = logger or default_logger
     try:
@@ -241,7 +322,7 @@ def load_payload_db(rows, file_id, column_map, logger=None):
     except Exception as e:
         logger.error(f"Error loading payload data: {e}")
         raise
-# Insert file metadata into database
+
 def insert_file_db(filename: str, file_url: str, email: Optional[str], header_index: int, logger=None) -> int:
     logger = logger or default_logger
     try:
@@ -300,7 +381,19 @@ async def submit_image(
             shutil.copyfileobj(fileUploadImage.file, buffer)
 
         s3_key_excel = f"uploads/{file_id}/{fileUploadImage.filename}"
-        file_url = upload_to_s3(uploaded_file_path, S3_CONFIG['bucket_name'], s3_key_excel)
+        urls = upload_to_s3(
+            uploaded_file_path, 
+            S3_CONFIG['bucket_name'], 
+            s3_key_excel, 
+            r2_bucket_name=S3_CONFIG['r2_bucket_name'],
+            logger=default_logger,
+            file_id=file_id
+        )
+        file_url_s3 = urls['s3']  # S3 URL for database
+        file_url_r2 = urls.get('r2')  # Public R2 URL for response
+        default_logger.info(f"Excel file uploaded to S3: {file_url_s3}")
+        if file_url_r2:
+            default_logger.info(f"Excel file also uploaded to R2: {file_url_r2}")
 
         extract_column_map = {
             'brand': 'MANUAL' if brandColImage == 'MANUAL' else validate_column(brandColImage),
@@ -322,16 +415,11 @@ async def submit_image(
         default_logger.debug(f"Extracted data: {extracted_data}")
         default_logger.info(f"Extracted for email: {sendToEmail}")
 
-        file_id_db = insert_file_db(fileUploadImage.filename, file_url, sendToEmail, header_index, default_logger)
+        file_id_db = insert_file_db(fileUploadImage.filename, file_url_s3, sendToEmail, header_index, default_logger)
 
         load_payload_db(extracted_data, file_id_db, extract_column_map, default_logger)
 
-        return {
-            "success": True,
-            "fileUrl": file_url,
-            "message": "File uploaded and processed successfully",
-            "file_id": file_id_db,
-        }
+        return (True, file_url_s3, file_url_r2, "File uploaded and processed successfully", file_id_db)
     except Exception as e:
         default_logger.error(f"Error processing file: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
@@ -340,7 +428,6 @@ async def submit_image(
             shutil.rmtree(temp_dir, ignore_errors=True)
         if extracted_images_dir and os.path.exists(extracted_images_dir):
             shutil.rmtree(extracted_images_dir, ignore_errors=True)
-from typing import Optional, Dict, List, Tuple
 
 def extract_data_and_images(
     file_path: str, 
@@ -358,10 +445,8 @@ def extract_data_and_images(
         extracted_images_dir = os.path.join("temp_files", "extracted_images", file_id)
         os.makedirs(extracted_images_dir, exist_ok=True)
 
-    # Header row index (1-based in Excel, so header_row + 1)
     header_idx = header_row 
 
-    # Extract header data for logging/validation only, not for payload
     header_data = {
         'search': sheet[f'{column_map["style"]}{header_idx}'].value if column_map.get('style') else None,
         'brand': manualBrand if column_map.get('brand') == 'MANUAL' else (
@@ -372,9 +457,8 @@ def extract_data_and_images(
     }
     default_logger.info(f"Header row {header_idx}: {header_data}")
 
-    # Extract data rows starting AFTER the header row
     extracted_data = []
-    for row_idx in range(header_row + 2, sheet.max_row + 1):  # Start from header_row + 2 to skip header
+    for row_idx in range(header_row + 2, sheet.max_row + 1):
         image_ref = None
         if column_map.get('image'):
             image_cell = f'{column_map["image"]}{row_idx}'
@@ -382,7 +466,7 @@ def extract_data_and_images(
 
         if column_map['brand'] == 'MANUAL':
             brand = manualBrand
-            default_logger.debug(f"Using manual brand: {brand} for row {row_idx}")
+            default_logger.debug(f"Using manual brand he {brand} for row {row_idx}")
         else:
             brand = (
                 sheet[f'{column_map["brand"]}{row_idx}'].value 
@@ -416,9 +500,18 @@ def extract_data_and_images(
             if image:
                 image.save(img_path)
                 s3_key = f"images/{file_id}/{os.path.basename(img_path)}"
-                s3_url = upload_to_s3(img_path, S3_CONFIG['bucket_name'], s3_key)
-                data['ExcelRowImageRef'] = s3_url
-                default_logger.info(f"Extracted and uploaded image from {image_cell} to {s3_url}")
+                urls = upload_to_s3(
+                    img_path, 
+                    S3_CONFIG['bucket_name'], 
+                    s3_key,
+                    r2_bucket_name=S3_CONFIG['r2_bucket_name'],
+                    logger=default_logger,
+                    file_id=file_id
+                )
+                data['ExcelRowImageRef'] = urls['s3']  # Use S3 URL for database
+                default_logger.info(f"Extracted and uploaded image from {image_cell} to S3: {urls['s3']}")
+                if 'r2' in urls:
+                    default_logger.info(f"Image also uploaded to R2: {urls['r2']}")
             else:
                 default_logger.warning(f"No image retrieved from cell {image_cell}")
 
@@ -428,7 +521,7 @@ def extract_data_and_images(
     default_logger.info(f"Total rows extracted (excluding header): {len(extracted_data)}")
 
     return extracted_data, extracted_images_dir
-# New endpoint for updating references
+
 @app.api_route("/api/update-references", methods=["GET", "POST"], response_model=ReferenceData)
 async def update_references(updated_data: Optional[ReferenceData] = None):
     github_url = "https://raw.githubusercontent.com/iconluxurygroup/settings-static-data/refs/heads/main/optimal-references.json"
@@ -447,7 +540,6 @@ async def update_references(updated_data: Optional[ReferenceData] = None):
 
     else:  # POST request
         try:
-            # Validate data
             if not updated_data.data:
                 raise HTTPException(status_code=400, detail="Data cannot be empty")
             if len(updated_data.data) != len(set(updated_data.data.keys())):
@@ -455,30 +547,27 @@ async def update_references(updated_data: Optional[ReferenceData] = None):
             if any(not key or not value for key, value in updated_data.data.items()):
                 raise HTTPException(status_code=400, detail="All fields must be non-empty")
 
-            # Save to temporary file
             temp_file = "temp_references.json"
             with open(temp_file, "w") as f:
                 json.dump(updated_data.data, f)
 
-            # Upload to S3
-            s3_client.upload_file(
+            urls = upload_to_s3(
                 temp_file,
                 S3_CONFIG["bucket_name"],
                 s3_key,
-                ExtraArgs={
-                    "ACL": "public-read",
-                    "ContentType": "application/json"
-                }
+                r2_bucket_name=S3_CONFIG['r2_bucket_name'],
+                logger=default_logger
             )
-            s3_url = f"{S3_CONFIG['endpoint']}/{S3_CONFIG['bucket_name']}/{s3_key}"
+            s3_url = urls['s3']
             default_logger.info(f"Uploaded updated references to S3: {s3_url}")
+            if 'r2' in urls:
+                default_logger.info(f"References also uploaded to R2: {urls['r2']}")
 
-            # Clean up
             os.remove(temp_file)
 
             return ReferenceData(data=updated_data.data)
         except Exception as e:
-            default_logger.error(f"Error uploading to S3: {e}")
+            default_logger.error(f"Error uploading to S3/R2: {e}")
             raise HTTPException(status_code=500, detail=f"Error saving data: {str(e)}")
 
 @app.get("/api/scraping-jobs", response_model=list[JobSummary])
@@ -522,7 +611,6 @@ async def get_all_jobs(page: int = 1, page_size: int = 10):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Detailed job endpoint (unchanged)
 @app.get("/api/scraping-jobs/{job_id}", response_model=JobDetails)
 async def get_job(job_id: int):
     try:
@@ -553,7 +641,7 @@ async def get_job(job_id: int):
 
         query_records = """
             SELECT EntryID, FileID, ExcelRowID, ProductModel, ProductBrand, CreateTime, Step1, Step2, 
-                   Step3, Step4, CompleteTime, ProductColor, ProductCategory,excelRowImageRef
+                   Step3, Step4, CompleteTime, ProductColor, ProductCategory, excelRowImageRef
             FROM utb_ImageScraperRecords
             WHERE FileID = ?
         """
@@ -599,13 +687,13 @@ async def get_job(job_id: int):
                     "productBrand": r.ProductBrand,
                     "createTime": r.CreateTime.isoformat() if r.CreateTime else None,
                     "step1": r.Step1.isoformat() if r.Step1 else None,
-                    "step2": r.Step2.isoformat() if r.Step1 else None,
-                    "step3": r.Step3.isoformat() if r.Step1 else None,
-                    "step4": r.Step4.isoformat() if r.Step1 else None,
+                    "step2": r.Step2.isoformat() if r.Step2 else None,
+                    "step3": r.Step3.isoformat() if r.Step3 else None,
+                    "step4": r.Step4.isoformat() if r.Step4 else None,
                     "completeTime": r.CompleteTime.isoformat() if r.CompleteTime else None,
                     "productColor": r.ProductColor if r.ProductColor else None,
                     "productCategory": r.ProductCategory if r.ProductCategory else None,
-                    "excelRowImageRef":r.excelRowImageRef if r.excelRowImageRef else None,
+                    "excelRowImageRef": r.excelRowImageRef if r.excelRowImageRef else None,
                 } for r in records
             ],
         }
@@ -615,14 +703,12 @@ async def get_job(job_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# New endpoint to aggregate all results by domain
 @app.get("/api/whitelist-domains", response_model=List[DomainAggregation])
 async def get_whitelist_domains():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Fetch all results from utb_ImageScraperResult
         query = """
             SELECT ImageSource, SortOrder
             FROM utb_ImageScraperResult
@@ -630,17 +716,15 @@ async def get_whitelist_domains():
         cursor.execute(query)
         rows = cursor.fetchall()
 
-        # Aggregate by domain
         domain_data = {}
         for row in rows:
             image_source = row.ImageSource if row.ImageSource else "unknown"
             sort_order = row.SortOrder if row.SortOrder is not None else -1
 
-            # Extract domain from ImageSource URL
             try:
                 from urllib.parse import urlparse
                 domain = urlparse(image_source).hostname or "unknown"
-                domain = domain.replace("www.", "")  # Remove "www." prefix
+                domain = domain.replace("www.", "")
             except:
                 domain = "unknown"
 
@@ -651,7 +735,6 @@ async def get_whitelist_domains():
             if sort_order > 0:
                 domain_data[domain]["positiveSortOrderCount"] += 1
 
-        # Convert to list for response
         aggregated_domains = [
             {
                 "domain": domain,
