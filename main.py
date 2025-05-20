@@ -16,7 +16,7 @@ import json
 import logging
 import urllib.parse
 import mimetypes
-
+import datetime
 # Initialize FastAPI app
 app = FastAPI(title="iconluxury.group backend", version="3.2.0")
 
@@ -345,13 +345,16 @@ def insert_file_db(filename: str, file_url: str, email: Optional[str], header_in
         logger.error(f"Error in insert_file_db: {e}")
         raise
 
+from fastapi import FastAPI, UploadFile, Form, HTTPException
+from typing import Optional
+
 @app.post("/submitImage")
 async def submit_image(
     fileUploadImage: UploadFile,
-    header_index: int = Form(...),
+    header_index: Optional[int] = Form(None),  # Make optional
     imageColumnImage: Optional[str] = Form(None),
-    searchColImage: str = Form(...),
-    brandColImage: str = Form(...),
+    searchColImage: Optional[str] = Form(None),  # Make optional
+    brandColImage: Optional[str] = Form(None),   # Make optional
     ColorColImage: Optional[str] = Form(None),
     CategoryColImage: Optional[str] = Form(None),
     sendToEmail: Optional[str] = Form(None),
@@ -359,63 +362,103 @@ async def submit_image(
 ):
     temp_dir = None
     extracted_images_dir = None
+    json_url = "https://iconluxury.group/static_settings/brand_rules.json"  # URL for column mappings
+    file_id = str(uuid.uuid4())
+    default_logger.info(f"Processing file for FileID: {file_id}")
+
     try:
-        file_id = str(uuid.uuid4())
-        default_logger.info(f"Processing file for FileID: {file_id}")
-        default_logger.info(f"Received: brandColImage={brandColImage}, manualBrand={manualBrand}, "
-                           f"searchColImage={searchColImage}, imageColumnImage={imageColumnImage}, "
-                           f"ColorColImage={ColorColImage}, CategoryColImage={CategoryColImage}, "
-                           f"header_index={header_index}")
+        # Validate user-provided header_index if specified
+        if header_index is not None and header_index < 1:
+            raise HTTPException(
+                status_code=400, detail="header_index must be 1 or greater (1-based row number)"
+            )
 
-        if header_index < 1:
-            raise HTTPException(status_code=400, detail="header_index must be 1 or greater (1-based row number)")
-
+        # Save uploaded file
         temp_dir = os.path.join("temp_files", "images", file_id)
         os.makedirs(temp_dir, exist_ok=True)
         uploaded_file_path = os.path.join(temp_dir, fileUploadImage.filename)
         with open(uploaded_file_path, "wb") as buffer:
             shutil.copyfileobj(fileUploadImage.file, buffer)
 
+        # Upload to S3/R2
         s3_key_excel = f"uploads/{file_id}/{fileUploadImage.filename}"
         urls = upload_to_s3(
-            uploaded_file_path, 
-            S3_CONFIG['bucket_name'], 
-            s3_key_excel, 
-            r2_bucket_name=S3_CONFIG['r2_bucket_name'],
+            uploaded_file_path,
+            S3_CONFIG["bucket_name"],
+            s3_key_excel,
+            r2_bucket_name=S3_CONFIG["r2_bucket_name"],
             logger=default_logger,
-            file_id=file_id
+            file_id=file_id,
         )
-        file_url_s3 = urls['s3']  # S3 URL for database
-        file_url_r2 = urls.get('r2')  # Public R2 URL for response
+        file_url_s3 = urls["s3"]
+        file_url_r2 = urls.get("r2")
         default_logger.info(f"Excel file uploaded to S3: {file_url_s3}")
         if file_url_r2:
             default_logger.info(f"Excel file also uploaded to R2: {file_url_r2}")
 
-        extract_column_map = {
-            'brand': 'MANUAL' if brandColImage == 'MANUAL' else validate_column(brandColImage),
-            'style': validate_column(searchColImage),
-            'image': validate_column(imageColumnImage) if imageColumnImage else None,
-            'color': validate_column(ColorColImage) if ColorColImage else None,
-            'category': validate_column(CategoryColImage) if CategoryColImage else None,
-            'manualBrand': manualBrand
-        }
-        default_logger.info(f"Column map: {extract_column_map}")
+        # Determine header row and column mappings
+        if header_index is None or not all(
+            [searchColImage, brandColImage or manualBrand]
+        ):
+            # Auto-detect header
+            column_mappings = fetch_column_mappings(json_url, default_logger)
+            header_index_auto, column_map = auto_detect_header(
+                uploaded_file_path,
+                column_mappings,
+                max_rows_to_scan=column_mappings.get("max_rows_to_scan", 10),
+                min_match_threshold=column_mappings.get("min_match_threshold", 0.6),
+                logger=default_logger,
+            )
+            default_logger.info(f"Using auto-detected header row {header_index_auto}")
+        else:
+            # Use user-provided values
+            header_index_auto = header_index
+            column_map = {
+                "style": validate_column(searchColImage) if searchColImage else None,
+                "brand": "MANUAL" if brandColImage == "MANUAL" else validate_column(brandColImage),
+                "image": validate_column(imageColumnImage) if imageColumnImage else None,
+                "color": validate_column(ColorColImage) if ColorColImage else None,
+                "category": validate_column(CategoryColImage) if CategoryColImage else None,
+                "manualBrand": manualBrand,
+            }
+            default_logger.info(f"Using user-provided header row {header_index_auto}")
 
-        if extract_column_map['brand'] == 'MANUAL' and not manualBrand:
-            raise HTTPException(status_code=400, detail="manualBrand is required when brandColImage is 'MANUAL'")
+        # Validate column map
+        if not column_map.get("style"):
+            raise HTTPException(status_code=400, detail="Style column is required")
+        if column_map.get("brand") == "MANUAL" and not column_map.get("manualBrand"):
+            raise HTTPException(
+                status_code=400, detail="manualBrand is required when brandColImage is 'MANUAL'"
+            )
 
+        default_logger.info(f"Final column map: {column_map}")
+
+        # Extract data and images
         extracted_data, extracted_images_dir = extract_data_and_images(
-            uploaded_file_path, file_id, extract_column_map, header_index,
-            manualBrand if extract_column_map['brand'] == 'MANUAL' else None
+            uploaded_file_path,
+            file_id,
+            column_map,
+            header_index_auto,
+            column_map.get("manualBrand"),
         )
         default_logger.debug(f"Extracted data: {extracted_data}")
         default_logger.info(f"Extracted for email: {sendToEmail}")
 
-        file_id_db = insert_file_db(fileUploadImage.filename, file_url_s3, sendToEmail, header_index, default_logger)
+        # Insert file record into database
+        file_id_db = insert_file_db(
+            fileUploadImage.filename, file_url_s3, sendToEmail, header_index_auto, default_logger
+        )
 
-        load_payload_db(extracted_data, file_id_db, extract_column_map, default_logger)
+        # Load data into database
+        load_payload_db(extracted_data, file_id_db, column_map, default_logger)
 
-        return (True, file_url_s3, file_url_r2, "File uploaded and processed successfully", file_id_db)
+        return (
+            True,
+            file_url_s3,
+            file_url_r2,
+            "File uploaded and processed successfully",
+            file_id_db,
+        )
     except Exception as e:
         default_logger.error(f"Error processing file: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
@@ -425,38 +468,176 @@ async def submit_image(
         if extracted_images_dir and os.path.exists(extracted_images_dir):
             shutil.rmtree(extracted_images_dir, ignore_errors=True)
 
+def fetch_column_mappings(json_url: str, logger=None) -> dict:
+    logger = logger or default_logger
+    try:
+        logger.info(f"Fetching column mappings from {json_url}")
+        response = requests.get(json_url)
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch JSON from {json_url}: Status {response.status_code}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to fetch column mappings from {json_url}"
+            )
+        mappings = response.json()
+        logger.info(f"Successfully fetched column mappings: {mappings}")
+        return mappings
+    except Exception as e:
+        logger.error(f"Error fetching column mappings from {json_url}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching column mappings: {str(e)}")
+from openpyxl import load_workbook
+import re
+from typing import Dict, Optional, Tuple
+
+def auto_detect_header(
+    file_path: str,
+    column_mappings: dict,
+    max_rows_to_scan: int = 10,
+    min_match_threshold: float = 0.6,
+    logger=None
+) -> Tuple[int, Dict[str, str]]:
+    logger = logger or default_logger
+    try:
+        wb = load_workbook(file_path, read_only=True)
+        sheet = wb.active
+        if not sheet:
+            raise ValueError("No active sheet found in Excel file")
+
+        best_header_row = -1
+        best_score = 0.0
+        best_column_map = {}
+
+        # Iterate through rows to find the header
+        for row_idx in range(1, min(max_rows_to_scan + 1, sheet.max_row + 1)):
+            row_values = [
+                str(cell.value).strip() if cell.value is not None else ""
+                for cell in sheet[row_idx]
+            ]
+            if not any(row_values):
+                continue  # Skip empty rows
+
+            column_map = {}
+            matches = 0
+            total_fields = len(column_mappings["columns"])
+
+            # Try to match each column value to a field
+            for col_idx, value in enumerate(row_values):
+                if not value:
+                    continue
+                for field, config in column_mappings["columns"].items():
+                    # Check exact name matches
+                    if value.lower() in [name.lower() for name in config.get("names", [])]:
+                        column_map[field] = chr(65 + col_idx)  # Convert to column letter (A, B, etc.)
+                        matches += 1
+                        break
+                    # Check regex patterns
+                    for pattern in config.get("patterns", []):
+                        if re.match(pattern, value, re.IGNORECASE):
+                            column_map[field] = chr(65 + col_idx)
+                            matches += 1
+                            break
+                    if field in column_map:
+                        break
+
+            # Calculate match score
+            score = matches / total_fields if total_fields > 0 else 0.0
+            logger.debug(
+                f"Row {row_idx}: Matches={matches}, Score={score:.2f}, Columns={column_map}"
+            )
+
+            # Update best match
+            if score >= min_match_threshold and score > best_score:
+                best_score = score
+                best_header_row = row_idx
+                best_column_map = column_map
+
+        wb.close()
+
+        if best_header_row == -1:
+            logger.error("No valid header row detected")
+            raise HTTPException(
+                status_code=400,
+                detail="Could not automatically detect header row. Please specify header_index."
+            )
+
+        # Validate required fields
+        required_fields = ["style"]  # 'style' is mandatory
+        missing_fields = [f for f in required_fields if f not in best_column_map]
+        if missing_fields:
+            logger.error(f"Missing required fields in header: {missing_fields}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Detected header row missing required fields: {missing_fields}"
+            )
+
+        # Handle manual brand if specified
+        if (
+            column_mappings.get("manual_brand", {}).get("allow_manual", False)
+            and "brand" not in best_column_map
+        ):
+            best_column_map["brand"] = "MANUAL"
+            best_column_map["manualBrand"] = column_mappings["manual_brand"].get(
+                "default", None
+            )
+
+        logger.info(
+            f"Detected header at row {best_header_row} with score {best_score:.2f}. Column map: {best_column_map}"
+        )
+        return best_header_row, best_column_map
+    except Exception as e:
+        logger.error(f"Error detecting header: {e}")
+        raise HTTPException(status_code=500, detail=f"Error detecting header: {str(e)}")    
 def extract_data_and_images(
-    file_path: str, 
-    file_id: str, 
-    column_map: Dict[str, str], 
-    header_row: int, 
-    manualBrand: Optional[str] = None
+    file_path: str,
+    file_id: str,
+    column_map: Dict[str, str],
+    header_row: int,
+    manualBrand: Optional[str] = None,
 ) -> Tuple[List[Dict], Optional[str]]:
     wb = load_workbook(file_path)
     sheet = wb.active
-    image_loader = SheetImageLoader(sheet) if column_map.get('image') else None
+    image_loader = SheetImageLoader(sheet) if column_map.get("image") else None
 
     extracted_images_dir = None
-    if column_map.get('image'):
+    if column_map.get("image"):
         extracted_images_dir = os.path.join("temp_files", "extracted_images", file_id)
         os.makedirs(extracted_images_dir, exist_ok=True)
 
-    header_idx = header_row 
+    header_idx = header_row
 
+    # Log header data
     header_data = {
-        'search': sheet[f'{column_map["style"]}{header_idx}'].value if column_map.get('style') else None,
-        'brand': manualBrand if column_map.get('brand') == 'MANUAL' else (
-            sheet[f'{column_map["brand"]}{header_idx}'].value if column_map.get('brand') else None
+        "search": (
+            sheet[f'{column_map["style"]}{header_idx}'].value
+            if column_map.get("style")
+            else None
         ),
-        'color': sheet[f'{column_map["color"]}{header_idx}'].value if column_map.get('color') else None,
-        'category': sheet[f'{column_map["category"]}{header_idx}'].value if column_map.get('category') else None,
+        "brand": (
+            manualBrand
+            if column_map.get("brand") == "MANUAL"
+            else (
+                sheet[f'{column_map["brand"]}{header_idx}'].value
+                if column_map.get("brand")
+                else None
+            )
+        ),
+        "color": (
+            sheet[f'{column_map["color"]}{header_idx}'].value
+            if column_map.get("color")
+            else None
+        ),
+        "category": (
+            sheet[f'{column_map["category"]}{header_idx}'].value
+            if column_map.get("category")
+            else None
+        ),
     }
-    default_logger.info(f"Header row {header_idx}: {header_data}")
+    default_logger.info(f"Header row {header_idx} data: {header_data}")
 
     extracted_data = []
-    for row_idx in range(header_row + 2, sheet.max_row + 1):
+    for row_idx in range(header_row + 1, sheet.max_row + 1):
         # Skip rows where all specified columns are empty
-        valid_columns = [col for col in column_map.values() if col and col != 'MANUAL']
+        valid_columns = [col for col in column_map.values() if col and col != "MANUAL"]
         try:
             if valid_columns and all(
                 sheet[f'{col}{row_idx}'].value is None for col in valid_columns
@@ -465,69 +646,70 @@ def extract_data_and_images(
                 continue
         except ValueError as e:
             default_logger.error(f"Invalid cell reference in row {row_idx}: {e}")
-            raise HTTPException(status_code=400, detail=f"Invalid cell reference in row {row_idx}: {str(e)}")
+            raise HTTPException(
+                status_code=400, detail=f"Invalid cell reference in row {row_idx}: {str(e)}"
+            )
 
         image_ref = None
-        if column_map.get('image'):
+        if column_map.get("image"):
             image_cell = f'{column_map["image"]}{row_idx}'
             image_ref = sheet[image_cell].value if sheet[image_cell] else None
 
-        if column_map['brand'] == 'MANUAL':
+        if column_map["brand"] == "MANUAL":
             brand = manualBrand
             default_logger.debug(f"Using manual brand {brand} for row {row_idx}")
         else:
             brand = (
-                sheet[f'{column_map["brand"]}{row_idx}'].value 
-                if column_map.get('brand') and sheet[f'{column_map["brand"]}{row_idx}'] 
+                sheet[f'{column_map["brand"]}{row_idx}'].value
+                if column_map.get("brand") and sheet[f'{column_map["brand"]}{row_idx}']
                 else None
             )
 
         data = {
-            'search': (
-                sheet[f'{column_map["style"]}{row_idx}'].value 
-                if column_map.get('style') and sheet[f'{column_map["style"]}{row_idx}'] 
+            "search": (
+                sheet[f'{column_map["style"]}{row_idx}'].value
+                if column_map.get("style") and sheet[f'{column_map["style"]}{row_idx}']
                 else None
             ),
-            'brand': brand,
-            'ExcelRowImageRef': image_ref,
-            'color': (
-                sheet[f'{column_map["color"]}{row_idx}'].value 
-                if column_map.get('color') and sheet[f'{column_map["color"]}{row_idx}'] 
+            "brand": brand,
+            "ExcelRowImageRef": image_ref,
+            "color": (
+                sheet[f'{column_map["color"]}{row_idx}'].value
+                if column_map.get("color") and sheet[f'{column_map["color"]}{row_idx}']
                 else None
             ),
-            'category': (
-                sheet[f'{column_map["category"]}{row_idx}'].value 
-                if column_map.get('category') and sheet[f'{column_map["category"]}{row_idx}'] 
+            "category": (
+                sheet[f'{column_map["category"]}{row_idx}'].value
+                if column_map.get("category") and sheet[f'{column_map["category"]}{row_idx}']
                 else None
             ),
         }
 
-        if column_map.get('image') and not data['ExcelRowImageRef'] and image_loader and image_loader.image_in(image_cell):
+        if column_map.get("image") and not data["ExcelRowImageRef"] and image_loader and image_loader.image_in(image_cell):
             img_path = os.path.join(extracted_images_dir, f"image_{file_id}_{image_cell}.png")
             image = image_loader.get(image_cell)
             if image:
                 image.save(img_path)
                 s3_key = f"images/{file_id}/{os.path.basename(img_path)}"
                 urls = upload_to_s3(
-                    img_path, 
-                    S3_CONFIG['bucket_name'], 
+                    img_path,
+                    S3_CONFIG["bucket_name"],
                     s3_key,
-                    r2_bucket_name=S3_CONFIG['r2_bucket_name'],
+                    r2_bucket_name=S3_CONFIG["r2_bucket_name"],
                     logger=default_logger,
-                    file_id=file_id
+                    file_id=file_id,
                 )
-                data['ExcelRowImageRef'] = urls['s3']  # Use S3 URL for database
+                data["ExcelRowImageRef"] = urls["s3"]
                 default_logger.info(f"Extracted and uploaded image from {image_cell} to S3: {urls['s3']}")
-                if 'r2' in urls:
+                if "r2" in urls:
                     default_logger.info(f"Image also uploaded to R2: {urls['r2']}")
             else:
                 default_logger.warning(f"No image retrieved from cell {image_cell}")
 
-        default_logger.info(f"Extracted data for row {row_idx - header_row - 1}: {data}")
+        default_logger.info(f"Extracted data for row {row_idx - header_row}: {data}")
         extracted_data.append(data)
 
     default_logger.info(f"Total rows extracted (excluding header): {len(extracted_data)}")
-
     return extracted_data, extracted_images_dir
 
 @app.api_route("/api/update-references", methods=["GET", "POST"], response_model=ReferenceData)
