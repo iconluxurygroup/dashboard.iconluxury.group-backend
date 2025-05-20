@@ -457,11 +457,15 @@ def extract_data_and_images(
     for row_idx in range(header_row + 2, sheet.max_row + 1):
         # Skip rows where all specified columns are empty
         valid_columns = [col for col in column_map.values() if col and col != 'MANUAL']
-        if valid_columns and all(
-            sheet[f'{col}{row_idx}'].value is None for col in valid_columns
-        ):
-            default_logger.debug(f"Skipping empty row {row_idx}")
-            continue
+        try:
+            if valid_columns and all(
+                sheet[f'{col}{row_idx}'].value is None for col in valid_columns
+            ):
+                default_logger.debug(f"Skipping empty row {row_idx}")
+                continue
+        except ValueError as e:
+            default_logger.error(f"Invalid cell reference in row {row_idx}: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid cell reference in row {row_idx}: {str(e)}")
 
         image_ref = None
         if column_map.get('image'):
