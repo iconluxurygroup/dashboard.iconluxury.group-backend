@@ -362,7 +362,7 @@ async def submit_image(
 ):
     temp_dir = None
     extracted_images_dir = None
-    json_url = "https://iconluxury.group/static_settings/brand_rules.json"  # URL for column mappings
+    json_url = "https://iconluxury.group/static_settings/header_labels.json"  # URL for column mappings
     file_id = str(uuid.uuid4())
     default_logger.info(f"Processing file for FileID: {file_id}")
 
