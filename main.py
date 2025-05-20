@@ -18,7 +18,7 @@ import urllib.parse
 import mimetypes
 
 # Initialize FastAPI app
-app = FastAPI(title="iconluxury.group backend", version="2.0.0")
+app = FastAPI(title="iconluxury.group backend", version="3.2.0")
 
 # Lightweight job model for initial list
 class JobSummary(BaseModel):
@@ -455,6 +455,14 @@ def extract_data_and_images(
 
     extracted_data = []
     for row_idx in range(header_row + 2, sheet.max_row + 1):
+        # Skip rows where all specified columns are empty
+        valid_columns = [col for col in column_map.values() if col and col != 'MANUAL']
+        if valid_columns and all(
+            sheet[f'{col}{row_idx}'].value is None for col in valid_columns
+        ):
+            default_logger.debug(f"Skipping empty row {row_idx}")
+            continue
+
         image_ref = None
         if column_map.get('image'):
             image_cell = f'{column_map["image"]}{row_idx}'
@@ -462,7 +470,7 @@ def extract_data_and_images(
 
         if column_map['brand'] == 'MANUAL':
             brand = manualBrand
-            default_logger.debug(f"Using manual brand he {brand} for row {row_idx}")
+            default_logger.debug(f"Using manual brand {brand} for row {row_idx}")
         else:
             brand = (
                 sheet[f'{column_map["brand"]}{row_idx}'].value 
