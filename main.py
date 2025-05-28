@@ -324,9 +324,9 @@ def insert_file_db(filename: str, file_url: str, email: Optional[str], header_in
         conn = get_db_connection()
         cursor = conn.cursor()
         query = """
-            INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl, UserEmail, UserHeaderIndex, CreateFileStartTime)
+            INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl, UserEmail, UserHeaderIndex,FileTypeID, CreateFileStartTime)
             OUTPUT INSERTED.ID
-            VALUES (?, ?, ?, ?, GETDATE())
+            VALUES (?, ?, ?, ?,?, GETDATE())
         """
         cursor.execute(query, (filename, file_url, email or 'nik@accessx.com', str(header_index),file_type))
         row = cursor.fetchone()
