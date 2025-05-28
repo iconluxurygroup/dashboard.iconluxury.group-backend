@@ -10,3 +10,4 @@ openpyxl-image-loader
 requests
 aiosmtplib
 sqlalchemy
+aiohttp
