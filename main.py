@@ -17,6 +17,14 @@ import logging
 import urllib.parse
 import mimetypes
 from datetime import datetime
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+import pyodbc
+from datetime import datetime
+
+# Assuming this code is part of the existing FastAPI app
+# If it's a separate module, ensure the app is imported or instantiated
 # Initialize FastAPI app
 app = FastAPI(title="iconluxury.group", version="3.5.5")
 
@@ -1089,6 +1097,189 @@ async def get_whitelist_domains():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# Response model for supplier offer summary
+class OfferSummary(BaseModel):
+    id: int
+    fileName: str
+    fileLocationUrl: str
+    userEmail: Optional[str]
+    createTime: Optional[str]
+    recordCount: int
+    nikOfferCount: int
+
+# Response model for detailed offer data
+class OfferDetails(BaseModel):
+    id: int
+    fileName: str
+    fileLocationUrl: str
+    userEmail: Optional[str]
+    createTime: Optional[str]
+    recordCount: int
+    nikOfferCount: int
+    sampleRecords: List[dict]
+    sampleNikOffers: List[dict]
+
+# Endpoint to list supplier offers
+@app.get("/luxurymarket/supplier/offers", response_model=List[OfferSummary])
+async def list_supplier_offers(page: int = 1, page_size: int = 10):
+    """
+    List supplier offers with pagination.
+    Returns a list of offers with metadata and counts of associated records.
+    """
+    try:
+        default_logger.info(f"Fetching supplier offers: page={page}, page_size={page_size}")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        offset = (page - 1) * page_size
+
+        query = """
+            SELECT 
+                ID, 
+                FileName, 
+                FileLocationUrl, 
+                UserEmail, 
+                CreateFileStartTime,
+                (SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = utb_ImageScraperFiles.ID) as record_count,
+                (SELECT COUNT(*) FROM utb_nikofferloadinitial WHERE FileID = utb_ImageScraperFiles.ID) as nikoffer_count
+            FROM utb_ImageScraperFiles
+            WHERE FileTypeID = 2
+            ORDER BY CreateFileStartTime DESC
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        """
+        cursor.execute(query, (offset, page_size))
+        rows = cursor.fetchall()
+
+        offers = [
+            OfferSummary(
+                id=row.ID,
+                fileName=row.FileName,
+                fileLocationUrl=row.FileLocationUrl,
+                userEmail=row.UserEmail,
+                createTime=row.CreateFileStartTime.isoformat() if row.CreateFileStartTime else None,
+                recordCount=row.record_count,
+                nikOfferCount=row.nikoffer_count
+            )
+            for row in rows
+        ]
+
+        default_logger.info(f"Retrieved {len(offers)} supplier offers")
+        conn.close()
+        return offers
+    except Exception as e:
+        default_logger.error(f"Error listing supplier offers: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+# Endpoint to get details of a specific supplier offer
+@app.get("/luxurymarket/supplier/offers/{offer_id}", response_model=OfferDetails)
+async def get_supplier_offer(offer_id: int):
+    """
+    Get detailed information about a specific supplier offer, including sample records.
+    """
+    try:
+        default_logger.info(f"Fetching details for supplier offer ID: {offer_id}")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Fetch offer metadata
+        query_offer = """
+            SELECT 
+                ID, 
+                FileName, 
+                FileLocationUrl, 
+                UserEmail, 
+                CreateFileStartTime,
+                (SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = utb_ImageScraperFiles.ID) as record_count,
+                (SELECT COUNT(*) FROM utb_nikofferloadinitial WHERE FileID = utb_ImageScraperFiles.ID) as nikoffer_count
+            FROM utb_ImageScraperFiles
+            WHERE ID = ? AND FileTypeID = 2
+        """
+        cursor.execute(query_offer, (offer_id,))
+        row = cursor.fetchone()
+
+        if not row:
+            default_logger.warning(f"Offer ID {offer_id} not found or not a supplier offer")
+            raise HTTPException(status_code=404, detail="Supplier offer not found")
+
+        # Fetch sample records from utb_ImageScraperRecords (limit to 5 for brevity)
+        query_records = """
+            SELECT TOP 5 
+                EntryID, 
+                ExcelRowID, 
+                ProductModel, 
+                ProductBrand, 
+                ProductColor, 
+                ProductCategory, 
+                ExcelRowImageRef
+            FROM utb_ImageScraperRecords
+            WHERE FileID = ?
+            ORDER BY ExcelRowID
+        """
+        cursor.execute(query_records, (offer_id,))
+        records = cursor.fetchall()
+        sample_records = [
+            {
+                "entryId": r.EntryID,
+                "excelRowId": r.ExcelRowID,
+                "productModel": r.ProductModel,
+                "productBrand": r.ProductBrand,
+                "productColor": r.ProductColor,
+                "productCategory": r.ProductCategory,
+                "excelRowImageRef": r.ExcelRowImageRef
+            }
+            for r in records
+        ]
+
+        # Fetch sample records from utb_nikofferloadinitial (limit to 5 for brevity)
+        query_nikoffers = """
+            SELECT TOP 5 
+                FileID, 
+                f0, f1, f2, f3, f4, 
+                f5, f6, f7, f8, f9
+            FROM utb_nikofferloadinitial
+            WHERE FileID = ?
+            ORDER BY FileID
+        """
+        cursor.execute(query_nikoffers, (offer_id,))
+        nikoffers = cursor.fetchall()
+        sample_nikoffers = [
+            {
+                "fileId": n.FileID,
+                "f0": n.f0,
+                "f1": n.f1,
+                "f2": n.f2,
+                "f3": n.f3,
+                "f4": n.f4,
+                "f5": n.f5,
+                "f6": n.f6,
+                "f7": n.f7,
+                "f8": n.f8,
+                "f9": n.f9
+            }
+            for n in nikoffers
+        ]
+
+        offer_details = OfferDetails(
+            id=row.ID,
+            fileName=row.FileName,
+            fileLocationUrl=row.FileLocationUrl,
+            userEmail=row.UserEmail,
+            createTime=row.CreateFileStartTime.isoformat() if row.CreateFileStartTime else None,
+            recordCount=row.record_count,
+            nikOfferCount=row.nikoffer_count,
+            sampleRecords=sample_records,
+            sampleNikOffers=sample_nikoffers
+        )
+
+        default_logger.info(f"Retrieved details for supplier offer ID: {offer_id}")
+        conn.close()
+        return offer_details
+    except Exception as e:
+        default_logger.error(f"Error fetching supplier offer {offer_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)
