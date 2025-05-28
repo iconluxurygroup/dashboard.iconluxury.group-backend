@@ -442,6 +442,7 @@ def extract_data_and_images(
         os.makedirs(extracted_images_dir, exist_ok=True)
 
     header_idx = header_row 
+    default_logger.info(f"Processing Excel file with header row: {header_idx}, max_row: {sheet.max_row}")
 
     header_data = {
         'search': sheet[f'{column_map["style"]}{header_idx}'].value if column_map.get('style') else None,
@@ -451,27 +452,32 @@ def extract_data_and_images(
         'color': sheet[f'{column_map["color"]}{header_idx}'].value if column_map.get('color') else None,
         'category': sheet[f'{column_map["category"]}{header_idx}'].value if column_map.get('category') else None,
     }
-    default_logger.info(f"Header row {header_idx}: {header_data}")
+    default_logger.info(f"Header row {header_idx} data: {header_data}")
 
     extracted_data = []
-    # Start from header_row + 1 instead of header_row + 2
-    for row_idx in range(header_row, sheet.max_row):
-        # Skip rows where all specified columns are empty
+    for row_idx in range(header_row + 1, sheet.max_row + 1):
+        default_logger.debug(f"Processing row {row_idx}")
+        # Skip rows where all specified columns are empty, but log the check
         valid_columns = [col for col in column_map.values() if col and col != 'MANUAL']
-        try:
-            if valid_columns and all(
-                sheet[f'{col}{row_idx}'].value is None for col in valid_columns
-            ):
-                default_logger.debug(f"Skipping empty row {row_idx}")
-                continue
-        except ValueError as e:
-            default_logger.error(f"Invalid cell reference in row {row_idx}: {e}")
-            raise HTTPException(status_code=400, detail=f"Invalid cell reference in row {row_idx}: {str(e)}")
+        row_is_empty = False
+        if valid_columns:
+            try:
+                cell_values = [sheet[f'{col}{row_idx}'].value for col in valid_columns]
+                row_is_empty = all(val is None for val in cell_values)
+                default_logger.debug(f"Row {row_idx} cell values: {dict(zip(valid_columns, cell_values))}")
+            except ValueError as e:
+                default_logger.error(f"Invalid cell reference in row {row_idx}: {e}")
+                raise HTTPException(status_code=400, detail=f"Invalid cell reference in row {row_idx}: {str(e)}")
+        
+        if row_is_empty:
+            default_logger.info(f"Skipping empty row {row_idx}")
+            continue
 
         image_ref = None
         if column_map.get('image'):
             image_cell = f'{column_map["image"]}{row_idx}'
             image_ref = sheet[image_cell].value if sheet[image_cell] else None
+            default_logger.debug(f"Image cell {image_cell} value: {image_ref}")
 
         if column_map['brand'] == 'MANUAL':
             brand = manualBrand
@@ -502,6 +508,7 @@ def extract_data_and_images(
                 else None
             ),
         }
+        default_logger.info(f"Extracted data for row {row_idx}: {data}")
 
         if column_map.get('image') and not data['ExcelRowImageRef'] and image_loader and image_loader.image_in(image_cell):
             img_path = os.path.join(extracted_images_dir, f"image_{file_id}_{image_cell}.png")
@@ -524,11 +531,9 @@ def extract_data_and_images(
             else:
                 default_logger.warning(f"No image retrieved from cell {image_cell}")
 
-        default_logger.info(f"Extracted data for row {row_idx - header_row}: {data}")
         extracted_data.append(data)
 
     default_logger.info(f"Total rows extracted (excluding header): {len(extracted_data)}")
-
     return extracted_data, extracted_images_dir
 
 @app.api_route("/api/update-references", methods=["GET", "POST"], response_model=ReferenceData)
