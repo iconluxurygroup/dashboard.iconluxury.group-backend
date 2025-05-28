@@ -9,7 +9,7 @@ from urllib.parse import quote_plus
 VERSION="5.0.1"
 SENDER_EMAIL="nik@luxurymarket.com"
 SENDER_PASSWORD="wvug kynd dfhd xrjh"
-SENDER_NAME='superscraper'
+SENDER_NAME='iconluxurygroup'
 GOOGLE_API_KEY='AIzaSyDXfc_kdxa5UX2h9D3WwktefCqdyjHasn8'
 # AWS credentials and region
 # config.py
