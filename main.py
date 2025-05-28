@@ -350,7 +350,8 @@ def insert_file_db(filename: str, file_url: str, email: Optional[str], header_in
 import csv
 
 # Revised function to insert data into utb_nikofferloadinitial
-def load_nikoffer_db(rows, file_id, logger=None):
+# New function to load data into utb_nikofferloadinitial
+def load_nikoffer_db(rows, file_id, headers=None, logger=None):
     logger = logger or default_logger
     try:
         file_id = int(file_id)
@@ -358,16 +359,16 @@ def load_nikoffer_db(rows, file_id, logger=None):
             cursor = connection.cursor()
             cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
             if cursor.fetchone()[0] == 0:
-                raise ValueError(f"FileID {file_id} does not exist in utb_ImageScraperFiles")
+                raise ValueError(f"FileID {file_id} not found in utb_ImageScraperFiles")
 
-            # Define expected columns for utb_nikofferloadinitial
+            # Define columns for utb_nikofferloadinitial
             nik_columns = ['FileID'] + [f'f{i}' for i in range(41)]  # FileID + f0 to f40
 
             df = pd.DataFrame(rows)
             logger.debug(f"Raw DataFrame for nikoffer (rows={len(df)}): {df.to_dict(orient='records')}")
 
-            # Get all columns from the DataFrame
-            file_columns = df.columns.tolist()
+            # Use provided headers or DataFrame columns
+            file_columns = headers if headers else df.columns.tolist()
             logger.debug(f"File columns: {file_columns}")
 
             # Map file columns to f0-f40 (up to 41), pad with None if fewer, truncate if more
@@ -384,7 +385,6 @@ def load_nikoffer_db(rows, file_id, logger=None):
                             row_values.append(None)
                         else:
                             value = row.get(col, None)
-                            # Convert all values to strings to avoid type mismatches
                             row_values.append(str(value) if value is not None else None)
                     
                     cursor.execute(
@@ -414,7 +414,7 @@ def load_nikoffer_db(rows, file_id, logger=None):
         logger.error(f"Error loading nikoffer data: {e}")
         raise
 
-# Updated /submitFullFile endpoint to handle any file type
+# Updated /submitFullFile endpoint for dynamic file uploads
 @app.post("/submitFullFile")
 async def submit_full_file(
     fileUpload: UploadFile,
@@ -457,18 +457,18 @@ async def submit_full_file(
 
         # Determine file type and extract data
         extracted_data = []
+        headers = []
         file_extension = os.path.splitext(fileUpload.filename)[1].lower()
 
         if file_extension in ['.xlsx', '.xls']:
             # Process Excel file
             wb = load_workbook(uploaded_file_path)
             sheet = wb.active
-            image_loader = SheetImageLoader(sheet)  # For image extraction
+            image_loader = SheetImageLoader(sheet)
 
             default_logger.info(f"Processing Excel file with header row: {header_index}, max_row: {sheet.max_row}")
 
             # Get headers
-            headers = []
             for col in sheet[header_index]:
                 headers.append(str(col.value) if col.value else f"Column_{col.column}")
             default_logger.debug(f"Headers: {headers}")
@@ -483,8 +483,8 @@ async def submit_full_file(
 
                 data = {header: value for header, value in zip(headers, row_values)}
                 
-                # Check for images
-                cell_ref = f"A{row_idx}"  # Assume images in first column (IMAGE)
+                # Check for images in first column (Picture)
+                cell_ref = f"A{row_idx}"
                 extracted_images_dir = os.path.join("temp_files", "extracted_images", file_id)
                 os.makedirs(extracted_images_dir, exist_ok=True)
                 if image_loader.image_in(cell_ref):
@@ -501,7 +501,8 @@ async def submit_full_file(
                             logger=default_logger,
                             file_id=file_id
                         )
-                        data['IMAGE'] = img_urls['s3']  # Store S3 URL in IMAGE column
+                        image_col = next((h for h in headers if 'image' in h.lower()), 'ExcelRowImageRef')
+                        data[image_col] = img_urls['s3']
                         default_logger.info(f"Extracted and uploaded image from {cell_ref} to S3: {img_urls['s3']}")
                         if 'r2' in img_urls:
                             default_logger.info(f"Image also uploaded to R2: {img_urls['r2']}")
@@ -511,26 +512,18 @@ async def submit_full_file(
 
         elif file_extension == '.csv':
             # Process CSV file
-            with open(uploaded_file_path, 'r', encoding='utf-8') as f:
-                reader = csv.reader(f)
-                rows = list(reader)
-                
-                if header_index > len(rows):
-                    raise HTTPException(status_code=400, detail="header_index exceeds CSV row count")
+            df = pd.read_csv(uploaded_file_path, header=header_index - 1, encoding='utf-8', low_memory=False)
+            df = df.where(pd.notnull(df), None)  # Convert NaN to None
+            headers = [str(col) if col else f"Column_{i+1}" for i, col in enumerate(df.columns)]
+            default_logger.debug(f"Headers: {headers}")
 
-                headers = rows[header_index - 1]  # CSV is 0-based, header_index is 1-based
-                headers = [h if h else f"Column_{i+1}" for i, h in enumerate(headers)]
-                default_logger.debug(f"Headers: {headers}")
-
-                for row_idx, row in enumerate(rows[header_index:], start=header_index):
-                    if len(row) == 0 or all(v == '' for v in row):
-                        default_logger.info(f"Skipping empty row {row_idx + 1}")
-                        continue
-                    # Pad or truncate row to match headers
-                    row = row[:len(headers)] + [''] * (len(headers) - len(row)) if len(row) < len(headers) else row[:len(headers)]
-                    data = {header: (v if v != '' else None) for header, v in zip(headers, row)}
-                    extracted_data.append(data)
-                    default_logger.info(f"Extracted data for row {row_idx + 1}: {data}")
+            for idx, row in df.iterrows():
+                if all(val is None for val in row):
+                    default_logger.info(f"Skipping empty row {idx + header_index}")
+                    continue
+                data = {header: row[col] for header, col in zip(headers, df.columns)}
+                extracted_data.append(data)
+                default_logger.info(f"Extracted data for row {idx + header_index}: {data}")
 
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_extension}")
@@ -542,11 +535,11 @@ async def submit_full_file(
         file_id_db = insert_file_db(fileUpload.filename, file_url_s3, sendToEmail, header_index, 2, default_logger)
 
         # Load extracted data into utb_ImageScraperRecords
-        column_map = infer_column_map(extracted_data)  # Infer column mappings
+        column_map = infer_column_map(extracted_data)
         load_payload_db(extracted_data, file_id_db, column_map, default_logger)
 
         # Load extracted data into utb_nikofferloadinitial
-        load_nikoffer_db(extracted_data, file_id_db, default_logger)
+        load_nikoffer_db(extracted_data, file_id_db, headers, default_logger)
 
         return {
             "success": True,
@@ -563,6 +556,7 @@ async def submit_full_file(
             shutil.rmtree(temp_dir, ignore_errors=True)
         if extracted_images_dir and os.path.exists(extracted_images_dir):
             shutil.rmtree(extracted_images_dir, ignore_errors=True)
+
 
 def infer_column_map(extracted_data: List[Dict]) -> Dict[str, str]:
     """
