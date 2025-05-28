@@ -319,6 +319,31 @@ def load_payload_db(rows, file_id, column_map, logger=None):
         logger.error(f"Error loading payload data: {e}")
         raise
 
+def insert_file_full_db(filename: str, file_url: str, email: Optional[str], header_index: int, logger=None) -> int:
+    logger = logger or default_logger
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        query = """
+            INSERT INTO utb_nikrawexceloffers (FileName, FileLocationUrl, UserEmail, UserHeaderIndex, CreateFileStartTime)
+            OUTPUT INSERTED.ID
+            VALUES (?, ?, ?, ?, GETDATE())
+        """
+        cursor.execute(query, (filename, file_url, email or 'nik@accessx.com', str(header_index)))
+        row = cursor.fetchone()
+        if row is None or row[0] is None:
+            raise Exception("Insert failed or no identity value returned.")
+        file_id = int(row[0])
+        conn.commit()
+        conn.close()
+        logger.info(f"Inserted file record with ID: {file_id} and header_index: {header_index}")
+        return file_id
+    except pyodbc.Error as e:
+        logger.error(f"Database error: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Error in insert_file_db: {e}")
+        raise
 def insert_file_db(filename: str, file_url: str, email: Optional[str], header_index: int, logger=None) -> int:
     logger = logger or default_logger
     try:
