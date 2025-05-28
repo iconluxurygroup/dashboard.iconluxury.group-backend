@@ -670,6 +670,7 @@ def extract_full_data_and_images(
 
     default_logger.info(f"Total rows extracted (excluding header): {len(extracted_data)}")
     return extracted_data, extracted_images_dir
+# Updated /submitImage endpoint
 @app.post("/submitImage")
 async def submit_image(
     fileUploadImage: UploadFile,
@@ -736,11 +737,17 @@ async def submit_image(
         default_logger.debug(f"Extracted data: {extracted_data}")
         default_logger.info(f"Extracted for email: {sendToEmail}")
 
-        file_id_db = insert_file_db(fileUploadImage.filename, file_url_s3, sendToEmail, header_index,1,default_logger)
+        file_id_db = insert_file_db(fileUploadImage.filename, file_url_s3, sendToEmail, header_index, 1, default_logger)
 
         load_payload_db(extracted_data, file_id_db, extract_column_map, default_logger)
 
-        return (True, file_url_s3, file_url_r2, "File uploaded and processed successfully", file_id_db)
+        return {
+            "success": True,
+            "s3_url": file_url_s3,
+            "r2_url": file_url_r2,
+            "message": "File uploaded and processed successfully",
+            "file_id": file_id_db
+        }
     except Exception as e:
         default_logger.error(f"Error processing file: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
