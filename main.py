@@ -417,7 +417,7 @@ async def submit_full_file(
         default_logger.info(f"Extracted for email: {sendToEmail}")
 
         # Insert file metadata into database
-        file_id_db = insert_file_db(fileUpload.filename, file_url_s3, sendToEmail, header_index, default_logger)
+        file_id_db = insert_file_full_db(fileUpload.filename, file_url_s3, sendToEmail, header_index, default_logger)
 
         # Load extracted data into database
         column_map = infer_column_map(extracted_data)  # Infer column mappings
