@@ -274,7 +274,6 @@ async def send_file_details_email(
             f"Uploaded By: {user_email or 'Unknown'}\n"
             f"Environment: iconluxury.group\n"
             f"Version: {VERSION}\n"
-            f"Restart Search Job: {restart_job_url}\n"
         )
         
         default_logger.info(f"Preparing to send email to {to_email} with subject: {subject}")
