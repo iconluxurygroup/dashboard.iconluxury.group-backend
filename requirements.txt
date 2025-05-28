@@ -8,3 +8,5 @@ uvicorn
 python-multipart
 openpyxl-image-loader
 requests
+aiosmtplib
+sqlalchemy

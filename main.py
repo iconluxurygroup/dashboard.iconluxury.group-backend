@@ -22,11 +22,12 @@ from pydantic import BaseModel
 from typing import List, Optional
 import pyodbc
 from datetime import datetime
-
+from config import VERSION
+from email_utils import send_message_email
 # Assuming this code is part of the existing FastAPI app
 # If it's a separate module, ensure the app is imported or instantiated
 # Initialize FastAPI app
-app = FastAPI(title="iconluxury.group", version="3.6.1")
+app = FastAPI(title="iconluxury.group", version=VERSION)
 
 # Lightweight job model for initial list
 class JobSummary(BaseModel):
@@ -238,7 +239,70 @@ def upload_to_s3(local_file_path, bucket_name, s3_key, r2_bucket_name=None, logg
             raise
     
     return result_urls
-
+async def send_file_details_email(
+    to_email: str,
+    file_id: int,
+    filename: str,
+    s3_url: str,
+    r2_url: str | None,
+    record_count: int,
+    nikoffer_count: int,
+    user_email: str | None
+) -> bool:
+    """
+    Send an email with file upload details to the specified recipient.
+    
+    Args:
+        to_email: Recipient email address
+        file_id: Database ID of the uploaded file
+        filename: Name of the uploaded file
+        s3_url: S3 URL of the uploaded file
+        r2_url: R2 URL of the uploaded file (if available)
+        record_count: Number of records processed
+        nikoffer_count: Number of nikoffer records processed
+        user_email: Email of the user who uploaded the file
+    
+    Returns:
+        bool: True if email sent successfully, False otherwise
+    """
+    try:
+        subject = f"File Upload Notification - File ID: {file_id}"
+        
+        # Construct the email message with file details
+        message = (
+            "File Upload Notification\n"
+            f"File ID: {file_id}\n"
+            f"File Name: {filename}\n"
+            f"S3 URL: {s3_url}\n"
+            f"R2 URL: {r2_url or 'Not available'}\n"
+            f"Upload Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Records Processed: {record_count}\n"
+            f"Nikoffer Records Processed: {nikoffer_count}\n"
+            f"Uploaded By: {user_email or 'Unknown'}\n"
+            f"Environment: iconluxury.group\n"
+            f"Version: {VERSION}"
+        )
+        
+        default_logger.info(f"Preparing to send email to {to_email} with subject: {subject}")
+        
+        # Send the email using the provided send_message_email function
+        success = await send_message_email(
+            to_emails=to_email,
+            subject=subject,
+            message=message,
+            logger=default_logger
+        )
+        
+        if success:
+            default_logger.info(f"Email sent successfully to {to_email}")
+            return True
+        else:
+            default_logger.error(f"Failed to send email to {to_email}")
+            return False
+            
+    except Exception as e:
+        default_logger.error(f"Error sending file details email to {to_email}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
 def validate_column(col: str) -> str:
     if not col or not re.match(r"^[A-Z]+$", col):
         raise HTTPException(
@@ -548,7 +612,21 @@ async def submit_full_file(
 
         # Load extracted data into utb_nikofferloadinitial
         load_nikoffer_db(extracted_data, file_id_db, headers, default_logger)
-
+        try:
+            await send_file_details_email(
+                to_email=sendToEmail or "nik@luxurymarket.com",
+                file_id=file_id_db,
+                filename=fileUpload.filename,
+                s3_url=file_url_s3,
+                r2_url=file_url_r2,
+                record_count=len(extracted_data),
+                nikoffer_count=len(extracted_data),  # Assuming same count for nikoffer
+                user_email=sendToEmail or "nik@accessx.com"
+            )
+        except Exception as e:
+            default_logger.error(f"Failed to send notification email: {e}")
+            # Optionally continue despite email failure
+            pass
         return {
             "success": True,
             "s3_url": file_url_s3,
@@ -742,7 +820,21 @@ async def submit_image(
         file_id_db = insert_file_db(fileUploadImage.filename, file_url_s3, sendToEmail, header_index, 1, default_logger)
 
         load_payload_db(extracted_data, file_id_db, extract_column_map, default_logger)
-
+        try:
+            await send_file_details_email(
+                to_email=sendToEmail or "nik@luxurymarket.com",
+                file_id=file_id_db,
+                filename=fileUploadImage.filename,
+                s3_url=file_url_s3,
+                r2_url=file_url_r2,
+                record_count=len(extracted_data),
+                nikoffer_count=len(extracted_data),  # Assuming same count for nikoffer
+                user_email=sendToEmail or "nik@accessx.com"
+            )
+        except Exception as e:
+            default_logger.error(f"Failed to send notification email: {e}")
+            # Optionally continue despite email failure
+            pass
         return {
             "success": True,
             "s3_url": file_url_s3,
