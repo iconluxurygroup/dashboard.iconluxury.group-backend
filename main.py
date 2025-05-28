@@ -927,6 +927,7 @@ async def get_all_jobs(page: int = 1, page_size: int = 10):
                 (SELECT COUNT(*) FROM utb_ImageScraperResult 
                  WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = utb_ImageScraperFiles.ID)) as img_count
             FROM utb_ImageScraperFiles
+            WHERE FileTypeID = 1
             ORDER BY ID DESC
             OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
         """
