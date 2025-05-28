@@ -1121,7 +1121,7 @@ class OfferDetails(BaseModel):
     sampleNikOffers: List[dict]
 
 # Endpoint to list supplier offers
-@app.get("/luxurymarket/supplier/offers", response_model=List[OfferSummary])
+@app.get("/api/luxurymarket/supplier/offers", response_model=List[OfferSummary])
 async def list_supplier_offers(page: int = 1, page_size: int = 10):
     """
     List supplier offers with pagination.
@@ -1173,7 +1173,7 @@ async def list_supplier_offers(page: int = 1, page_size: int = 10):
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
 # Endpoint to get details of a specific supplier offer
-@app.get("/luxurymarket/supplier/offers/{offer_id}", response_model=OfferDetails)
+@app.get("/api/luxurymarket/supplier/offers/{offer_id}", response_model=OfferDetails)
 async def get_supplier_offer(offer_id: int):
     """
     Get detailed information about a specific supplier offer, including sample records.
