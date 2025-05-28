@@ -26,7 +26,7 @@ from datetime import datetime
 # Assuming this code is part of the existing FastAPI app
 # If it's a separate module, ensure the app is imported or instantiated
 # Initialize FastAPI app
-app = FastAPI(title="iconluxury.group", version="3.5.5")
+app = FastAPI(title="iconluxury.group", version="3.6.1")
 
 # Lightweight job model for initial list
 class JobSummary(BaseModel):
