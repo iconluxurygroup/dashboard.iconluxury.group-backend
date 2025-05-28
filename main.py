@@ -454,7 +454,8 @@ def extract_data_and_images(
     default_logger.info(f"Header row {header_idx}: {header_data}")
 
     extracted_data = []
-    for row_idx in range(header_row + 2, sheet.max_row + 1):
+    # Start from header_row + 1 instead of header_row + 2
+    for row_idx in range(header_row + 1, sheet.max_row + 1):
         # Skip rows where all specified columns are empty
         valid_columns = [col for col in column_map.values() if col and col != 'MANUAL']
         try:
@@ -523,7 +524,7 @@ def extract_data_and_images(
             else:
                 default_logger.warning(f"No image retrieved from cell {image_cell}")
 
-        default_logger.info(f"Extracted data for row {row_idx - header_row - 1}: {data}")
+        default_logger.info(f"Extracted data for row {row_idx - header_row}: {data}")
         extracted_data.append(data)
 
     default_logger.info(f"Total rows extracted (excluding header): {len(extracted_data)}")
