@@ -318,7 +318,7 @@ def load_payload_db(rows, file_id, column_map, logger=None):
     except Exception as e:
         logger.error(f"Error loading payload data: {e}")
         raise
-def insert_file_db(filename: str, file_url: str, email: Optional[str], header_index: int, file_type: int = 1 ,logger=None) -> int:
+def insert_file_db(filename: str, file_url: str, email: Optional[str], header_index: int, file_type: int ,logger=None) -> int:
     logger = logger or default_logger
     try:
         conn = get_db_connection()
@@ -585,7 +585,7 @@ async def submit_image(
         default_logger.debug(f"Extracted data: {extracted_data}")
         default_logger.info(f"Extracted for email: {sendToEmail}")
 
-        file_id_db = insert_file_db(fileUploadImage.filename, file_url_s3, sendToEmail, header_index,default_logger)
+        file_id_db = insert_file_db(fileUploadImage.filename, file_url_s3, sendToEmail, header_index,1,default_logger)
 
         load_payload_db(extracted_data, file_id_db, extract_column_map, default_logger)
 
