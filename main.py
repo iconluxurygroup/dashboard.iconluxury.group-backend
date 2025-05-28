@@ -239,6 +239,12 @@ def upload_to_s3(local_file_path, bucket_name, s3_key, r2_bucket_name=None, logg
             raise
     
     return result_urls
+
+
+import aiohttp
+from fastapi import HTTPException
+from datetime import datetime
+
 async def send_file_details_email(
     to_email: str,
     file_id: int,
@@ -249,26 +255,13 @@ async def send_file_details_email(
     nikoffer_count: int,
     user_email: str | None
 ) -> bool:
-    """
-    Send an email with file upload details to the specified recipient.
-    
-    Args:
-        to_email: Recipient email address
-        file_id: Database ID of the uploaded file
-        filename: Name of the uploaded file
-        s3_url: S3 URL of the uploaded file
-        r2_url: R2 URL of the uploaded file (if available)
-        record_count: Number of records processed
-        nikoffer_count: Number of nikoffer records processed
-        user_email: Email of the user who uploaded the file
-    
-    Returns:
-        bool: True if email sent successfully, False otherwise
-    """
     try:
         subject = f"File Upload Notification - File ID: {file_id}"
         
-        # Construct the email message with file details
+        # Construct the restart job URL
+        restart_job_url = f"https://icon7-8080.iconluxury.today/api/v4/restart-search-all/{file_id}"
+        
+        # Construct the email message with file details and restart job link
         message = (
             "File Upload Notification\n"
             f"File ID: {file_id}\n"
@@ -280,11 +273,25 @@ async def send_file_details_email(
             f"Nikoffer Records Processed: {nikoffer_count}\n"
             f"Uploaded By: {user_email or 'Unknown'}\n"
             f"Environment: iconluxury.group\n"
-            f"Version: {VERSION}"
+            f"Version: {VERSION}\n"
+            f"Restart Search Job: {restart_job_url}\n"
         )
         
         default_logger.info(f"Preparing to send email to {to_email} with subject: {subject}")
         
+        # Send the POST request to restart the search job
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                restart_job_url,
+                headers={"accept": "application/json"}
+            ) as response:
+                if response.status == 200:
+                    default_logger.info(f"Successfully triggered restart search job for file ID {file_id}")
+                else:
+                    default_logger.error(f"Failed to trigger restart search job for file ID {file_id}: {response.status}")
+                    # Optionally, you could raise an exception or continue without failing the email
+                    # raise HTTPException(status_code=500, detail=f"Failed to trigger restart job: {response.status}")
+
         # Send the email using the provided send_message_email function
         success = await send_message_email(
             to_emails=to_email,
@@ -303,6 +310,8 @@ async def send_file_details_email(
     except Exception as e:
         default_logger.error(f"Error sending file details email to {to_email}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
+
+
 def validate_column(col: str) -> str:
     if not col or not re.match(r"^[A-Z]+$", col):
         raise HTTPException(
