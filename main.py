@@ -18,7 +18,7 @@ import urllib.parse
 import mimetypes
 
 # Initialize FastAPI app
-app = FastAPI(title="iconluxury.group backend", version="3.2.2")
+app = FastAPI(title="iconluxury.group", version="3.5.5")
 
 # Lightweight job model for initial list
 class JobSummary(BaseModel):
@@ -344,7 +344,181 @@ def insert_file_db(filename: str, file_url: str, email: Optional[str], header_in
     except Exception as e:
         logger.error(f"Error in insert_file_db: {e}")
         raise
+@app.post("/submitFullFile")
+async def submit_full_file(
+    fileUpload: UploadFile,
+    header_index: int = Form(...),
+    sendToEmail: Optional[str] = Form(None),
+):
+    temp_dir = None
+    extracted_images_dir = None
+    try:
+        file_id = str(uuid.uuid4())
+        default_logger.info(f"Processing full file for FileID: {file_id}")
+        default_logger.info(f"Received: header_index={header_index}, sendToEmail={sendToEmail}")
 
+        if header_index < 1:
+            raise HTTPException(status_code=400, detail="header_index must be 1 or greater (1-based row number)")
+
+        # Create temporary directory for file processing
+        temp_dir = os.path.join("temp_files", "full_files", file_id)
+        os.makedirs(temp_dir, exist_ok=True)
+        uploaded_file_path = os.path.join(temp_dir, fileUpload.filename)
+        with open(uploaded_file_path, "wb") as buffer:
+            shutil.copyfileobj(fileUpload.file, buffer)
+
+        # Upload file to S3 and R2
+        s3_key_excel = f"uploads/{file_id}/{fileUpload.filename}"
+        urls = upload_to_s3(
+            uploaded_file_path,
+            S3_CONFIG['bucket_name'],
+            s3_key_excel,
+            r2_bucket_name=S3_CONFIG['r2_bucket_name'],
+            logger=default_logger,
+            file_id=file_id
+        )
+        file_url_s3 = urls['s3']  # S3 URL for database
+        file_url_r2 = urls.get('r2')  # Public R2 URL for response
+        default_logger.info(f"Excel file uploaded to S3: {file_url_s3}")
+        if file_url_r2:
+            default_logger.info(f"Excel file also uploaded to R2: {file_url_r2}")
+
+        # Extract data and images from the file
+        extracted_data, extracted_images_dir = extract_full_data_and_images(
+            uploaded_file_path, file_id, header_index
+        )
+        default_logger.debug(f"Extracted data: {extracted_data}")
+        default_logger.info(f"Extracted for email: {sendToEmail}")
+
+        # Insert file metadata into database
+        file_id_db = insert_file_db(fileUpload.filename, file_url_s3, sendToEmail, header_index, default_logger)
+
+        # Load extracted data into database
+        column_map = infer_column_map(extracted_data)  # Infer column mappings
+        load_payload_db(extracted_data, file_id_db, column_map, default_logger)
+
+        return {
+            "success": True,
+            "s3_url": file_url_s3,
+            "r2_url": file_url_r2,
+            "message": "File uploaded and processed successfully",
+            "file_id": file_id_db
+        }
+    except Exception as e:
+        default_logger.error(f"Error processing file: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+    finally:
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        if extracted_images_dir and os.path.exists(extracted_images_dir):
+            shutil.rmtree(extracted_images_dir, ignore_errors=True)
+
+def infer_column_map(extracted_data: List[Dict]) -> Dict[str, str]:
+    """
+    Infer column mappings based on common column names in the extracted data.
+    Returns a column map compatible with load_payload_db.
+    """
+    if not extracted_data:
+        return {'brand': None, 'style': None, 'image': None, 'color': None, 'category': None}
+
+    # Get the first row to inspect available columns
+    columns = list(extracted_data[0].keys())
+    default_logger.debug(f"Inferring column map from columns: {columns}")
+
+    # Common patterns for column names
+    patterns = {
+        'style': [r'model', r'style', r'product_model', r'sku', r'item'],
+        'brand': [r'brand', r'manufacturer', r'product_brand'],
+        'color': [r'color', r'colour', r'product_color'],
+        'category': [r'category', r'product_category', r'type'],
+        'image': [r'image', r'photo', r'picture', r'excelrowimageref']
+    }
+
+    column_map = {'brand': None, 'style': None, 'image': None, 'color': None, 'category': None}
+    
+    for col in columns:
+        col_lower = col.lower()
+        for field, field_patterns in patterns.items():
+            if any(re.search(pattern, col_lower) for pattern in field_patterns):
+                if not column_map[field]:  # Only assign if not already set
+                    column_map[field] = col
+                    default_logger.debug(f"Mapped column '{col}' to field '{field}'")
+
+    default_logger.info(f"Inferred column map: {column_map}")
+    return column_map
+
+def extract_full_data_and_images(
+    file_path: str,
+    file_id: str,
+    header_row: int
+) -> Tuple[List[Dict], Optional[str]]:
+    """
+    Extract all data and images from an Excel file without specific column targets.
+    """
+    wb = load_workbook(file_path)
+    sheet = wb.active
+    image_loader = SheetImageLoader(sheet)  # Always check for images
+
+    extracted_images_dir = os.path.join("temp_files", "extracted_images", file_id)
+    os.makedirs(extracted_images_dir, exist_ok=True)
+
+    header_idx = header_row
+    default_logger.info(f"Processing Excel file with header row: {header_idx}, max_row: {sheet.max_row}")
+
+    # Get headers
+    headers = []
+    for col in sheet[header_idx]:
+        if col.value:
+            headers.append(str(col.value))
+        else:
+            headers.append(f"Column_{col.column}")  # Fallback for empty headers
+    default_logger.debug(f"Headers: {headers}")
+
+    extracted_data = []
+    for row_idx in range(header_row + 1, sheet.max_row + 1):
+        default_logger.debug(f"Processing row {row_idx}")
+        # Check if row is empty
+        row_values = [sheet.cell(row=row_idx, column=col_idx).value for col_idx in range(1, len(headers) + 1)]
+        if all(val is None for val in row_values):
+            default_logger.info(f"Skipping empty row {row_idx}")
+            continue
+
+        data = {header: None for header in headers}
+        for col_idx, header in enumerate(headers, start=1):
+            cell = sheet.cell(row=row_idx, column=col_idx)
+            cell_ref = f"{cell.column_letter}{row_idx}"
+            data[header] = cell.value
+
+            # Check for images in the cell
+            if image_loader.image_in(cell_ref):
+                img_path = os.path.join(extracted_images_dir, f"image_{file_id}_{cell_ref}.png")
+                image = image_loader.get(cell_ref)
+                if image:
+                    image.save(img_path)
+                    s3_key = f"images/{file_id}/{os.path.basename(img_path)}"
+                    urls = upload_to_s3(
+                        img_path,
+                        S3_CONFIG['bucket_name'],
+                        s3_key,
+                        r2_bucket_name=S3_CONFIG['r2_bucket_name'],
+                        logger=default_logger,
+                        file_id=file_id
+                    )
+                    # Store image URL in a dedicated column if not already present
+                    image_col = next((h for h in headers if 'image' in h.lower()), 'ExcelRowImageRef')
+                    if image_col not in data:
+                        data[image_col] = urls['s3']
+                    else:
+                        data[image_col] = urls['s3']
+                    default_logger.info(f"Extracted and uploaded image from {cell_ref} to S3: {urls['s3']}")
+                    if 'r2' in urls:
+                        default_logger.info(f"Image also uploaded to R2: {urls['r2']}")
+
+        extracted_data.append(data)
+        default_logger.info(f"Extracted data for row {row_idx}: {data}")
+
+    default_logger.info(f"Total rows extracted (excluding header): {len(extracted_data)}")
+    return extracted_data, extracted_images_dir
 @app.post("/submitImage")
 async def submit_image(
     fileUploadImage: UploadFile,
