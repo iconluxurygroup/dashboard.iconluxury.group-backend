@@ -755,7 +755,7 @@ def extract_data_and_images(
     file_id: str, 
     column_map: Dict[str, str], 
     header_row: int, 
-    manualBrand: Optional[str] = None
+    manual_brand: Optional[str] = None
 ) -> Tuple[List[Dict], Optional[str]]:
     wb = load_workbook(file_path)
     sheet = wb.active
@@ -769,9 +769,13 @@ def extract_data_and_images(
     header_idx = header_row 
     default_logger.info(f"Processing Excel file with header row: {header_idx}, max_row: {sheet.max_row}")
 
+    # Define valid columns, excluding 'MANUAL' and manualBrand
+    valid_columns = [col for col in column_map.values() if col and col != 'MANUAL' and col != manual_brand]
+    default_logger.debug(f"Valid columns: {valid_columns}")
+
     header_data = {
         'search': sheet[f'{column_map["style"]}{header_idx}'].value if column_map.get('style') else None,
-        'brand': manualBrand if column_map.get('brand') == 'MANUAL' else (
+        'brand': manual_brand if column_map.get('brand') == 'MANUAL' else (
             sheet[f'{column_map["brand"]}{header_idx}'].value if column_map.get('brand') else None
         ),
         'color': sheet[f'{column_map["color"]}{header_idx}'].value if column_map.get('color') else None,
@@ -782,8 +786,7 @@ def extract_data_and_images(
     extracted_data = []
     for row_idx in range(header_row + 1, sheet.max_row + 1):
         default_logger.debug(f"Processing row {row_idx}")
-        # Skip rows where all specified columns are empty, but log the check
-        valid_columns = [col for col in column_map.values() if col and col != 'MANUAL']
+        # Skip rows where all specified columns are empty
         row_is_empty = False
         if valid_columns:
             try:
@@ -791,7 +794,7 @@ def extract_data_and_images(
                 row_is_empty = all(val is None for val in cell_values)
                 default_logger.debug(f"Row {row_idx} cell values: {dict(zip(valid_columns, cell_values))}")
             except ValueError as e:
-                default_logger.error(f"Invalid cell reference in row {row_idx}: {e}")
+                default_logger.error(f"Invalid cell reference in row {row_idx}: {str(e)}")
                 raise HTTPException(status_code=400, detail=f"Invalid cell reference in row {row_idx}: {str(e)}")
         
         if row_is_empty:
@@ -801,36 +804,32 @@ def extract_data_and_images(
         image_ref = None
         if column_map.get('image'):
             image_cell = f'{column_map["image"]}{row_idx}'
-            image_ref = sheet[image_cell].value if sheet[image_cell] else None
-            default_logger.debug(f"Image cell {image_cell} value: {image_ref}")
+            try:
+                image_ref = sheet[image_cell].value if sheet[image_cell] else None
+                default_logger.debug(f"Image cell {image_cell} value: {image_ref}")
+            except ValueError:
+                default_logger.error(f"Invalid image cell reference: {image_cell}")
+                image_ref = None
 
-        if column_map['brand'] == 'MANUAL':
-            brand = manualBrand
-            default_logger.debug(f"Using manual brand {brand} for row {row_idx}")
-        else:
-            brand = (
-                sheet[f'{column_map["brand"]}{row_idx}'].value 
-                if column_map.get('brand') and sheet[f'{column_map["brand"]}{row_idx}'] 
-                else None
-            )
+        brand = manual_brand if column_map['brand'] == 'MANUAL' else (
+            sheet[f'{column_map["brand"]}{row_idx}'].value 
+            if column_map.get('brand') and column_map['brand'] != 'MANUAL' else None
+        )
 
         data = {
             'search': (
-                sheet[f'{column_map["style"]}{row_idx}'].value 
-                if column_map.get('style') and sheet[f'{column_map["style"]}{row_idx}'] 
-                else None
+                str(sheet[f'{column_map["style"]}{row_idx}'].value) 
+                if column_map.get('style') else None
             ),
-            'brand': brand,
+            'brand': str(brand) if brand is not None else None,
             'ExcelRowImageRef': image_ref,
             'color': (
-                sheet[f'{column_map["color"]}{row_idx}'].value 
-                if column_map.get('color') and sheet[f'{column_map["color"]}{row_idx}'] 
-                else None
+                str(sheet[f'{column_map["color"]}{row_idx}'].value) 
+                if column_map.get('color') else None
             ),
             'category': (
-                sheet[f'{column_map["category"]}{row_idx}'].value 
-                if column_map.get('category') and sheet[f'{column_map["category"]}{row_idx}'] 
-                else None
+                str(sheet[f'{column_map["category"]}{row_idx}'].value) 
+                if column_map.get('category') else None
             ),
         }
         default_logger.info(f"Extracted data for row {row_idx}: {data}")
