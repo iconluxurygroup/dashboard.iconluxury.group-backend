@@ -16,7 +16,7 @@ import json
 import logging
 import urllib.parse
 import mimetypes
-
+from datetime import datetime
 # Initialize FastAPI app
 app = FastAPI(title="iconluxury.group", version="3.5.5")
 
@@ -366,7 +366,7 @@ async def submit_full_file(
         uploaded_file_path = os.path.join(temp_dir, fileUpload.filename)
         with open(uploaded_file_path, "wb") as buffer:
             shutil.copyfileobj(fileUpload.file, buffer)
-        from datetime import datetime
+
         upload_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         # Upload file to S3 and R2
         s3_key_excel = f"luxurymarket/supplier/offer/{upload_timestamp}/{file_id}/{fileUpload.filename}"
