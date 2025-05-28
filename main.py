@@ -455,7 +455,7 @@ def extract_data_and_images(
 
     extracted_data = []
     # Start from header_row + 1 instead of header_row + 2
-    for row_idx in range(header_row + 1, sheet.max_row + 1):
+    for row_idx in range(header_row, sheet.max_row):
         # Skip rows where all specified columns are empty
         valid_columns = [col for col in column_map.values() if col and col != 'MANUAL']
         try:
