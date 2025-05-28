@@ -18,7 +18,7 @@ import urllib.parse
 import mimetypes
 
 # Initialize FastAPI app
-app = FastAPI(title="iconluxury.group backend", version="3.2.0")
+app = FastAPI(title="iconluxury.group backend", version="3.2.2")
 
 # Lightweight job model for initial list
 class JobSummary(BaseModel):
@@ -760,4 +760,4 @@ async def get_whitelist_domains():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
