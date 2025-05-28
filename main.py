@@ -318,6 +318,8 @@ def load_payload_db(rows, file_id, column_map, logger=None):
     except Exception as e:
         logger.error(f"Error loading payload data: {e}")
         raise
+
+
 def insert_file_db(filename: str, file_url: str, email: Optional[str], header_index: int, file_type: int ,logger=None) -> int:
     logger = logger or default_logger
     try:
@@ -343,6 +345,78 @@ def insert_file_db(filename: str, file_url: str, email: Optional[str], header_in
     except Exception as e:
         logger.error(f"Error in insert_file_db: {e}")
         raise
+
+# ... (Previous imports and unchanged code remain the same)
+
+# New function to insert data into utb_nikofferloadinitial
+def load_nikoffer_db(rows, file_id, logger=None):
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        with get_db_connection() as connection:
+            cursor = connection.cursor()
+            cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
+            if cursor.fetchone()[0] == 0:
+                raise ValueError(f"FileID {file_id} does not exist in utb_ImageScraperFiles")
+
+            # Define expected columns for utb_nikofferloadinitial (FileID + f0 to f40)
+            nik_columns = ['FileID'] + [f'f{i}' for i in range(41)]  # f0 to f40
+            excel_columns = [
+                'Picture', 'Style #', 'Description', 'Season',
+                '24', '25', '26', '27', '28', '29', '30', '32', '36', '38', '40', '42', '44', '46', '48',
+                'XXS', 'XS', 'S', 'M', 'L', 'XL', 'XXL', 'XS/S', 'S/M', 'M/L', 'L/XL',
+                'QTY', 'RRP', 'PRICE', 'Discount', 'TOT RRP', 'TOT PRICE', 'WHLS PRICE', 'RRP PRICE',
+                'Custom1', 'Custom2', 'Custom3'  # Placeholder for f38 to f40
+            ]
+
+            df = pd.DataFrame(rows)
+            logger.debug(f"Raw DataFrame for nikoffer (rows={len(df)}): {df.to_dict(orient='records')}")
+
+            # Ensure all expected Excel columns exist, fill missing with None
+            for col in excel_columns:
+                if col not in df.columns:
+                    df[col] = None
+                df[col] = df[col].where(df[col].notna(), None)
+
+            # Add FileID and ExcelRowID
+            df['FileID'] = file_id
+            df['ExcelRowID'] = range(1, len(df) + 1)
+
+            # Insert rows into utb_nikofferloadinitial
+            rows_inserted = 0
+            for idx, row in df.iterrows():
+                try:
+                    # Map Excel columns to f0-f40, truncate to 41 fields
+                    row_values = [row.get(col, None) for col in excel_columns[:41]]
+                    row_values.insert(0, file_id)  # Prepend FileID
+                    cursor.execute(
+                        f"INSERT INTO utb_nikofferloadinitial ({', '.join(nik_columns)}) "
+                        f"VALUES ({', '.join(['?'] * len(nik_columns))})",
+                        tuple(row_values)
+                    )
+                    rows_inserted += 1
+                except Exception as e:
+                    logger.error(f"Error inserting row {idx + 1} into utb_nikofferloadinitial: {e}")
+
+            connection.commit()
+            logger.info(f"Committed {rows_inserted} rows into utb_nikofferloadinitial for FileID: {file_id}")
+
+            # Verify insertion
+            cursor.execute(
+                f"SELECT FileID, {', '.join([f'f{i}' for i in range(41)])} "
+                f"FROM utb_nikofferloadinitial WHERE FileID = ? ORDER BY FileID",
+                (file_id,)
+            )
+            inserted_rows = cursor.fetchall()
+            logger.debug(f"All data from utb_nikofferloadinitial for FileID {file_id}: {inserted_rows}")
+
+        logger.info(f"Loaded {len(df)} rows into utb_nikofferloadinitial for FileID: {file_id}")
+        return df
+    except Exception as e:
+        logger.error(f"Error loading nikoffer data: {e}")
+        raise
+
+# Updated /submitFullFile endpoint
 @app.post("/submitFullFile")
 async def submit_full_file(
     fileUpload: UploadFile,
@@ -391,11 +465,14 @@ async def submit_full_file(
         default_logger.info(f"Extracted for email: {sendToEmail}")
 
         # Insert file metadata into database
-        file_id_db = insert_file_db(fileUpload.filename, file_url_s3, sendToEmail, header_index, 2,default_logger)
+        file_id_db = insert_file_db(fileUpload.filename, file_url_s3, sendToEmail, header_index, 2, default_logger)
 
-        # Load extracted data into database
+        # Load extracted data into utb_ImageScraperRecords
         column_map = infer_column_map(extracted_data)  # Infer column mappings
         load_payload_db(extracted_data, file_id_db, column_map, default_logger)
+
+        # Load extracted data into utb_nikofferloadinitial
+        load_nikoffer_db(extracted_data, file_id_db, default_logger)
 
         return {
             "success": True,
