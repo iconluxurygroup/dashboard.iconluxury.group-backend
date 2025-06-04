@@ -893,7 +893,7 @@ def extract_data_and_images(
     default_logger.info(f"Header row {header_idx} data: {header_data}")
 
     extracted_data = []
-    for row_idx in range(header_row, sheet.max_row + 1):
+    for row_idx in range(header_row + 1, sheet.max_row + 1):
         default_logger.debug(f"Processing row {row_idx}")
         # Skip rows where all specified columns are empty
         row_is_empty = False
