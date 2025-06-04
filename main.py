@@ -1271,7 +1271,250 @@ async def list_supplier_offers(page: int = 1, page_size: int = 10):
     except Exception as e:
         default_logger.error(f"Error listing supplier offers: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+# Add to imports if not already present
+from pathlib import Path
+import uuid
+import urllib.parse
 
+# New function to load data into utb_OfferImport
+def load_offer_import_db(rows, file_id, logger=None):
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        with get_db_connection() as connection:
+            cursor = connection.cursor()
+            cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
+            if cursor.fetchone()[0] == 0:
+                raise ValueError(f"FileID {file_id} not found in utb_ImageScraperFiles")
+
+            # Define columns for utb_OfferImport (assuming up to 41 columns like utb_nikofferloadinitial)
+            offer_columns = ['FileID'] + [f'f{i}' for i in range(41)]  # FileID + f0 to f40
+
+            # Convert rows to DataFrame for processing
+            df = pd.DataFrame(rows)
+            logger.debug(f"Raw DataFrame for utb_OfferImport (rows={len(df)}): {df.to_dict(orient='records')}")
+
+            # Ensure all values are strings or None to preserve original format
+            df = df.astype(str).where(df.notna(), None)
+
+            # Insert rows into utb_OfferImport
+            rows_inserted = 0
+            for idx, row in df.iterrows():
+                try:
+                    # Prepare values: FileID + up to 41 columns
+                    row_values = [file_id] + [row.get(i, None) for i in range(min(len(row), 41))]
+                    # Pad with None if fewer than 41 columns
+                    row_values += [None] * (42 - len(row_values))
+                    
+                    cursor.execute(
+                        f"INSERT INTO utb_OfferImport ({', '.join(offer_columns)}) "
+                        f"VALUES ({', '.join(['?'] * len(offer_columns))})",
+                        tuple(row_values)
+                    )
+                    rows_inserted += 1
+                except Exception as e:
+                    logger.error(f"Error inserting row {idx + 1} into utb_OfferImport: {e}")
+
+            connection.commit()
+            logger.info(f"Committed {rows_inserted} rows into utb_OfferImport for FileID: {file_id}")
+
+            # Verify insertion
+            cursor.execute(
+                f"SELECT FileID, {', '.join([f'f{i}' for i in range(41)])} "
+                f"FROM utb_OfferImport WHERE FileID = ? ORDER BY FileID",
+                (file_id,)
+            )
+            inserted_rows = cursor.fetchall()
+            logger.debug(f"All data from utb_OfferImport for FileID {file_id}: {inserted_rows}")
+
+        logger.info(f"Loaded {len(df)} rows into utb_OfferImport for FileID: {file_id}")
+        return df
+    except Exception as e:
+        logger.error(f"Error loading offer import data: {e}")
+        raise
+
+@app.post("/submitOffer")
+async def submit_offer(
+    fileUrl: str = Form(...),
+    header_index: int = Form(...),
+    sendToEmail: Optional[str] = Form(None),
+):
+    temp_dir = None
+    extracted_images_dir = None
+    try:
+        file_id = str(uuid.uuid4())
+        default_logger.info(f"Processing offer file for FileID: {file_id}")
+        default_logger.info(f"Received: fileUrl={fileUrl}, header_index={header_index}, sendToEmail={sendToEmail}")
+
+        if header_index < 1:
+            raise HTTPException(status_code=400, detail="header_index must be 1 or greater (1-based row number)")
+
+        # Create temporary directory for file processing
+        temp_dir = os.path.join("temp_files", "offers", file_id)
+        os.makedirs(temp_dir, exist_ok=True)
+
+        # Download the file
+        response = requests.get(fileUrl)
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"Failed to download file from {fileUrl}")
+
+        # Extract filename from URL
+        parsed_url = urllib.parse.urlparse(fileUrl)
+        filename = os.path.basename(parsed_url.path)
+        if not filename:
+            raise HTTPException(status_code=400, detail="Could not determine filename from URL")
+
+        uploaded_file_path = os.path.join(temp_dir, filename)
+        with open(uploaded_file_path, "wb") as f:
+            f.write(response.content)
+        default_logger.info(f"Downloaded file to {uploaded_file_path}")
+
+        upload_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        # Upload file to S3 and R2
+        s3_key_excel = f"luxurymarket/supplier/offer/{upload_timestamp}/{file_id}/{filename}"
+        urls = upload_to_s3(
+            uploaded_file_path,
+            S3_CONFIG['bucket_name'],
+            s3_key_excel,
+            r2_bucket_name=S3_CONFIG['r2_bucket_name'],
+            logger=default_logger,
+            file_id=file_id
+        )
+        file_url_s3 = urls['s3']  # S3 URL for database
+        file_url_r2 = urls.get('r2')  # Public R2 URL for response
+        default_logger.info(f"File uploaded to S3: {file_url_s3}")
+        if file_url_r2:
+            default_logger.info(f"File also uploaded to R2: {file_url_r2}")
+
+        # Determine file type and process data
+        extracted_data = []
+        file_extension = os.path.splitext(filename)[1].lower()
+
+        if file_extension in ['.xlsx', '.xls']:
+            # Process Excel file
+            wb = load_workbook(uploaded_file_path)
+            sheet = wb.active
+
+            default_logger.info(f"Processing Excel file, max_row: {sheet.max_row}")
+
+            # Create directory for extracted images
+            extracted_images_dir = os.path.join("temp_files", "extracted_images", file_id)
+            os.makedirs(extracted_images_dir, exist_ok=True)
+
+            # Read all rows starting from row 1 (no header processing)
+            for row_idx in range(1, sheet.max_row + 1):
+                row_values = [sheet.cell(row=row_idx, column=col_idx).value for col_idx in range(1, sheet.max_column + 1)]
+                # Skip empty rows
+                if all(val is None or str(val).strip() == '' for val in row_values):
+                    default_logger.info(f"Skipping empty row {row_idx}")
+                    continue
+
+                # Check for image filename in first column
+                if row_values[0] and isinstance(row_values[0], str) and re.match(r'.+\.(png|jpg|jpeg|gif)$', row_values[0], re.IGNORECASE):
+                    image_filename = row_values[0]
+                    image_path = os.path.join(extracted_images_dir, image_filename)
+                    # Assume image file exists in the same directory as the uploaded file or needs to be provided
+                    # For this implementation, we'll assume the image is accessible locally or needs to be downloaded
+                    # If images are in the same directory as the file, adjust the path accordingly
+                    if os.path.exists(image_path):
+                        s3_key = f"images/{file_id}/{image_filename}"
+                        img_urls = upload_to_s3(
+                            image_path,
+                            S3_CONFIG['bucket_name'],
+                            s3_key,
+                            r2_bucket_name=S3_CONFIG['r2_bucket_name'],
+                            logger=default_logger,
+                            file_id=file_id
+                        )
+                        # Replace the image filename with the R2 URL
+                        row_values[0] = img_urls.get('r2', img_urls['s3'])
+                        default_logger.info(f"Uploaded image {image_filename} to R2: {row_values[0]}")
+                    else:
+                        default_logger.warning(f"Image file {image_filename} not found at {image_path}")
+
+                extracted_data.append(row_values)
+                default_logger.info(f"Extracted data for row {row_idx}: {row_values}")
+
+        elif file_extension == '.csv':
+            # Process CSV file
+            with open(uploaded_file_path, 'r', encoding='utf-8') as csv_file:
+                csv_reader = csv.reader(csv_file)
+                for row_idx, row in enumerate(csv_reader, start=1):
+                    # Skip empty rows
+                    row_values = [val if val.strip() != '' else None for val in row]
+                    if all(val is None for val in row_values):
+                        default_logger.info(f"Skipping empty row {row_idx}")
+                        continue
+
+                    # Check for image filename in first column
+                    if row_values[0] and re.match(r'.+\.(png|jpg|jpeg|gif)$', row_values[0], re.IGNORECASE):
+                        image_filename = row_values[0]
+                        image_path = os.path.join(extracted_images_dir or temp_dir, image_filename)
+                        if os.path.exists(image_path):
+                            s3_key = f"images/{file_id}/{image_filename}"
+                            img_urls = upload_to_s3(
+                                image_path,
+                                S3_CONFIG['bucket_name'],
+                                s3_key,
+                                r2_bucket_name=S3_CONFIG['r2_bucket_name'],
+                                logger=default_logger,
+                                file_id=file_id
+                            )
+                            # Replace the image filename with the R2 URL
+                            row_values[0] = img_urls.get('r2', img_urls['s3'])
+                            default_logger.info(f"Uploaded image {image_filename} to R2: {row_values[0]}")
+                        else:
+                            default_logger.warning(f"Image file {image_filename} not found at {image_path}")
+
+                    extracted_data.append(row_values)
+                    default_logger.info(f"Extracted data for row {row_idx}: {row_values}")
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_extension}")
+
+        default_logger.info(f"Total rows extracted: {len(extracted_data)}")
+        default_logger.info(f"Extracted for email: {sendToEmail}")
+
+        # Insert file metadata into database
+        file_id_db = insert_file_db(filename, file_url_s3, sendToEmail, header_index, 2, default_logger)
+
+        # Load extracted data into utb_OfferImport
+        load_offer_import_db(extracted_data, file_id_db, default_logger)
+
+        # Send notification email
+        try:
+            await send_file_details_email(
+                to_email=sendToEmail or "nik@luxurymarket.com",
+                file_id=file_id_db,
+                filename=filename,
+                s3_url=file_url_s3,
+                r2_url=file_url_r2,
+                record_count=len(extracted_data),
+                nikoffer_count=0,  # No nikoffer data in this case
+                user_email=sendToEmail or "nik@accessx.com"
+            )
+        except Exception as e:
+            default_logger.error(f"Failed to send notification email: {e}")
+            # Continue despite email failure
+            pass
+
+        return {
+            "success": True,
+            "s3_url": file_url_s3,
+            "r2_url": file_url_r2,
+            "message": "Offer file downloaded and processed successfully",
+            "file_id": file_id_db
+        }
+
+    except Exception as e:
+        default_logger.error(f"Error processing offer file: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+    finally:
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        if extracted_images_dir and os.path.exists(extracted_images_dir):
+            shutil.rmtree(extracted_images_dir, ignore_errors=True)
 # Endpoint to get details of a specific supplier offer
 @app.get("/api/luxurymarket/supplier/offers/{offer_id}", response_model=OfferDetails)
 async def get_supplier_offer(offer_id: int):
