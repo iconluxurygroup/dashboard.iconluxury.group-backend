@@ -91,6 +91,19 @@ class DomainAggregation(BaseModel):
     domain: str
     totalResults: int
     positiveSortOrderCount: int
+# Model for job progress
+class JobProgress(BaseModel):
+    fileId: int
+    totalRecords: int
+    step1Completed: int
+    step1Progress: float
+    step2Completed: int
+    step2Progress: float
+    step3Completed: int
+    step3Progress: float
+    step4Completed: int
+    step4Progress: float
+
 
 # Model for reference data
 class ReferenceData(BaseModel):
@@ -1623,6 +1636,81 @@ async def get_supplier_offer(offer_id: int):
     except Exception as e:
         default_logger.error(f"Error fetching supplier offer {offer_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+
+# New endpoint to get job progress
+@app.get("/api/scraping-jobs/{file_id}/progress", response_model=JobProgress)
+async def get_job_progress(file_id: int):
+    """
+    Get the processing progress for a specific job (file).
+    Calculates progress for Step1, Step2, Step3, and Step4.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # First, check if the FileID is valid to provide a clear 404 error
+        cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
+        if cursor.fetchone()[0] == 0:
+            raise HTTPException(status_code=404, detail=f"Job with FileID {file_id} not found.")
+
+        # Use COUNT(column) to count non-null values, which is faster than CASE statements
+        query = """
+            SELECT
+                COUNT(*) AS TotalRecords,
+                COUNT(Step1) AS Step1Completed,
+                COUNT(Step2) AS Step2Completed,
+                COUNT(Step3) AS Step3Completed,
+                COUNT(Step4) AS Step4Completed
+            FROM utb_ImageScraperRecords
+            WHERE FileID = ?
+        """
+        cursor.execute(query, (file_id,))
+        progress_data = cursor.fetchone()
+        conn.close()
+
+        if not progress_data:
+            # This case is unlikely if the FileID exists, but good practice to handle
+            raise HTTPException(status_code=404, detail=f"No records found for FileID {file_id}.")
+
+        total_records = progress_data.TotalRecords
+        
+        # Handle the case where a file has been created but records are not yet loaded
+        if total_records == 0:
+            return JobProgress(
+                fileId=file_id, totalRecords=0,
+                step1Completed=0, step1Progress=0.0,
+                step2Completed=0, step2Progress=0.0,
+                step3Completed=0, step3Progress=0.0,
+                step4Completed=0, step4Progress=0.0
+            )
+
+        # Calculate progress for each step
+        step1_progress = (progress_data.Step1Completed / total_records) * 100
+        step2_progress = (progress_data.Step2Completed / total_records) * 100
+        step3_progress = (progress_data.Step3Completed / total_records) * 100
+        step4_progress = (progress_data.Step4Completed / total_records) * 100
+
+        return JobProgress(
+            fileId=file_id,
+            totalRecords=total_records,
+            step1Completed=progress_data.Step1Completed,
+            step1Progress=round(step1_progress, 2),
+            step2Completed=progress_data.Step2Completed,
+            step2Progress=round(step2_progress, 2),
+            step3Completed=progress_data.Step3Completed,
+            step3Progress=round(step3_progress, 2),
+            step4Completed=progress_data.Step4Completed,
+            step4Progress=round(step4_progress, 2),
+        )
+    except HTTPException as http_exc:
+        # Re-raise known HTTP exceptions to avoid masking them as 500 errors
+        raise http_exc
+    except Exception as e:
+        default_logger.error(f"Error getting job progress for FileID {file_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)
