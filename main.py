@@ -17,17 +17,18 @@ import logging
 import urllib.parse
 import mimetypes
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
-import pyodbc
-from datetime import datetime
+import aiohttp
+from pathlib import Path
+import csv
+
+# These are assumed to be in your project directory
 from config import VERSION
 from email_utils import send_message_email
-# Assuming this code is part of the existing FastAPI app
-# If it's a separate module, ensure the app is imported or instantiated
+
 # Initialize FastAPI app
 app = FastAPI(title="iconluxury.group", version=VERSION)
+
+# --- Pydantic Models ---
 
 # Lightweight job model for initial list
 class JobSummary(BaseModel):
@@ -96,6 +97,31 @@ class DomainAggregation(BaseModel):
 class ReferenceData(BaseModel):
     data: Dict[str, str]
 
+# Response model for supplier offer summary
+class OfferSummary(BaseModel):
+    id: int
+    fileName: str
+    fileLocationUrl: str
+    userEmail: Optional[str]
+    createTime: Optional[str]
+    recordCount: int
+    nikOfferCount: int
+
+# Response model for detailed offer data
+class OfferDetails(BaseModel):
+    id: int
+    fileName: str
+    fileLocationUrl: str
+    userEmail: Optional[str]
+    createTime: Optional[str]
+    recordCount: int
+    nikOfferCount: int
+    sampleRecords: List[dict]
+    sampleNikOffers: List[dict]
+
+
+# --- Configuration and Setup ---
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -133,8 +159,11 @@ S3_CONFIG = {
 logging.basicConfig(level=logging.INFO)
 default_logger = logging.getLogger(__name__)
 
-# Database connection function
+
+# --- Helper Functions ---
+
 def get_db_connection():
+    """Establishes a connection to the MSSQL database."""
     conn_str = (
         f"DRIVER={DB_CONFIG['driver']};"
         f"SERVER={DB_CONFIG['server']};"
@@ -144,8 +173,8 @@ def get_db_connection():
     )
     return pyodbc.connect(conn_str)
 
-# S3 and R2 upload function
 def get_s3_client(service='s3', logger=None, file_id=None):
+    """Creates a Boto3 client for either AWS S3 or Cloudflare R2."""
     logger = logger or default_logger
     if logger == default_logger and file_id:
         logger.info(f"Setup logger for get_s3_client, FileID: {file_id}")
@@ -175,6 +204,7 @@ def get_s3_client(service='s3', logger=None, file_id=None):
         raise
 
 def double_encode_plus(filename, logger=None):
+    """URL-encodes a filename, specifically handling '+' characters."""
     logger = logger or default_logger
     logger.debug(f"Encoding filename: {filename}")
     first_pass = filename.replace('+', '%2B')
@@ -183,19 +213,18 @@ def double_encode_plus(filename, logger=None):
     return second_pass
 
 def upload_to_s3(local_file_path, bucket_name, s3_key, r2_bucket_name=None, logger=None, file_id=None):
+    """Uploads a local file to AWS S3 and optionally to Cloudflare R2."""
     logger = logger or default_logger
     if logger == default_logger and file_id:
         logger.info(f"Setup logger for upload_to_s3, FileID: {file_id}")
     
     result_urls = {}
     
-    # Determine Content-Type
     content_type, _ = mimetypes.guess_type(local_file_path)
     if not content_type:
         content_type = 'application/octet-stream'
         logger.warning(f"Could not determine Content-Type for {local_file_path}")
     
-    # Upload to AWS S3
     try:
         s3_client = get_s3_client(service='s3', logger=logger, file_id=file_id)
         logger.info(f"Uploading {local_file_path} to S3: {bucket_name}/{s3_key}")
@@ -203,10 +232,7 @@ def upload_to_s3(local_file_path, bucket_name, s3_key, r2_bucket_name=None, logg
             local_file_path,
             bucket_name,
             s3_key,
-            ExtraArgs={
-                'ACL': 'public-read',
-                'ContentType': content_type
-            }
+            ExtraArgs={'ACL': 'public-read', 'ContentType': content_type}
         )
         double_encoded_key = double_encode_plus(s3_key, logger=logger)
         s3_url = f"https://{bucket_name}.s3.{S3_CONFIG['region']}.amazonaws.com/{double_encoded_key}"
@@ -216,7 +242,6 @@ def upload_to_s3(local_file_path, bucket_name, s3_key, r2_bucket_name=None, logg
         logger.error(f"Failed to upload {local_file_path} to S3: {e}")
         raise
     
-    # Upload to Cloudflare R2 (if r2_bucket_name is provided)
     if r2_bucket_name:
         try:
             r2_client = get_s3_client(service='r2', logger=logger, file_id=file_id)
@@ -225,10 +250,7 @@ def upload_to_s3(local_file_path, bucket_name, s3_key, r2_bucket_name=None, logg
                 local_file_path,
                 r2_bucket_name,
                 s3_key,
-                ExtraArgs={
-                    'ACL': 'public-read',
-                    'ContentType': content_type
-                }
+                ExtraArgs={'ACL': 'public-read', 'ContentType': content_type}
             )
             double_encoded_key = double_encode_plus(s3_key, logger=logger)
             r2_url = f"{S3_CONFIG['r2_custom_domain']}/{double_encoded_key}"
@@ -240,11 +262,6 @@ def upload_to_s3(local_file_path, bucket_name, s3_key, r2_bucket_name=None, logg
     
     return result_urls
 
-
-import aiohttp
-from fastapi import HTTPException
-from datetime import datetime
-
 async def send_file_details_email(
     to_email: str,
     file_id: int,
@@ -255,13 +272,11 @@ async def send_file_details_email(
     nikoffer_count: int,
     user_email: str | None
 ) -> bool:
+    """Sends a notification email and triggers a backend job restart."""
     try:
         subject = f"File Upload Notification - File ID: {file_id}"
-        
-        # Construct the restart job URL
         restart_job_url = f"https://icon7-8080.iconluxury.today/api/v4/restart-search-all/{file_id}"
         
-        # Construct the email message with file details and restart job link
         message = (
             "File Upload Notification\n"
             f"File ID: {file_id}\n"
@@ -278,26 +293,14 @@ async def send_file_details_email(
         
         default_logger.info(f"Preparing to send email to {to_email} with subject: {subject}")
         
-        # Send the POST request to restart the search job
         async with aiohttp.ClientSession() as session:
-            async with session.post(
-                restart_job_url,
-                headers={"accept": "application/json"}
-            ) as response:
+            async with session.post(restart_job_url, headers={"accept": "application/json"}) as response:
                 if response.status == 200:
                     default_logger.info(f"Successfully triggered restart search job for file ID {file_id}")
                 else:
                     default_logger.error(f"Failed to trigger restart search job for file ID {file_id}: {response.status}")
-                    # Optionally, you could raise an exception or continue without failing the email
-                    # raise HTTPException(status_code=500, detail=f"Failed to trigger restart job: {response.status}")
 
-        # Send the email using the provided send_message_email function
-        success = await send_message_email(
-            to_emails=to_email,
-            subject=subject,
-            message=message,
-            logger=default_logger
-        )
+        success = await send_message_email(to_emails=to_email, subject=subject, message=message, logger=default_logger)
         
         if success:
             default_logger.info(f"Email sent successfully to {to_email}")
@@ -310,8 +313,8 @@ async def send_file_details_email(
         default_logger.error(f"Error sending file details email to {to_email}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
 
-
 def validate_column(col: str) -> str:
+    """Validates that a string is a valid Excel column name (e.g., 'A', 'AA')."""
     if not col or not re.match(r"^[A-Z]+$", col):
         raise HTTPException(
             status_code=400,
@@ -319,7 +322,32 @@ def validate_column(col: str) -> str:
         )
     return col
 
+def insert_file_db(filename: str, file_url: str, email: Optional[str], header_index: int, file_type: int ,logger=None) -> int:
+    """Inserts a new file record into the utb_ImageScraperFiles table."""
+    logger = logger or default_logger
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        query = """
+            INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl, UserEmail, UserHeaderIndex, FileTypeID, CreateFileStartTime)
+            OUTPUT INSERTED.ID
+            VALUES (?, ?, ?, ?, ?, GETDATE())
+        """
+        cursor.execute(query, (filename, file_url, email or 'nik@accessx.com', str(header_index), file_type))
+        row = cursor.fetchone()
+        if row is None or row[0] is None:
+            raise Exception("Insert failed or no identity value returned.")
+        file_id = int(row[0])
+        conn.commit()
+        conn.close()
+        logger.info(f"Inserted file record with ID: {file_id}, FileTypeID: {file_type}, header_index: {header_index}")
+        return file_id
+    except Exception as e:
+        logger.error(f"Error in insert_file_db: {e}", exc_info=True)
+        raise
+
 def load_payload_db(rows, file_id, column_map, logger=None):
+    """Loads extracted data into the utb_ImageScraperRecords table."""
     logger = logger or default_logger
     try:
         file_id = int(file_id)
@@ -330,108 +358,39 @@ def load_payload_db(rows, file_id, column_map, logger=None):
                 raise ValueError(f"FileID {file_id} does not exist in utb_ImageScraperFiles")
 
             df = pd.DataFrame(rows)
-            logger.debug(f"Raw DataFrame (rows={len(df)}): {df.to_dict(orient='records')}")
-
-            # Rename columns to match database fields
             rename_dict = {
-                'search': 'ProductModel',
-                'brand': 'ProductBrand',
-                'color': 'ProductColor',
-                'category': 'ProductCategory',
-                'ExcelRowImageRef': 'ExcelRowImageRef'
+                'search': 'ProductModel', 'brand': 'ProductBrand', 'color': 'ProductColor',
+                'category': 'ProductCategory', 'ExcelRowImageRef': 'ExcelRowImageRef'
             }
             df = df.rename(columns=rename_dict)
-            logger.debug(f"DataFrame after renaming: {df.to_dict(orient='records')}")
+            
+            if column_map.get('brand') == 'MANUAL':
+                df['ProductBrand'] = column_map.get('manualBrand', '')
 
-            # Apply manual brand if specified
-            if column_map['brand'] == 'MANUAL':
-                manual_brand_value = column_map.get('manualBrand', '')
-                if not manual_brand_value:
-                    logger.warning("brandColImage is 'MANUAL' but manualBrand is empty or None")
-                df['ProductBrand'] = manual_brand_value
-                logger.debug(f"Applied manual brand: '{manual_brand_value}' to all rows")
-
-            # Add required columns
             df['FileID'] = file_id
             df['ExcelRowID'] = range(1, len(df) + 1)
-
-            logger.debug(f"DataFrame after adding FileID and ExcelRowID: {df.to_dict(orient='records')}")
-
-            # Define expected columns
+            
             expected_cols = ['FileID', 'ExcelRowID', 'ProductModel', 'ProductBrand', 'ProductColor', 'ProductCategory', 'ExcelRowImageRef']
-
-            # Ensure all expected columns exist
             for col in expected_cols:
                 if col not in df.columns:
                     df[col] = None
                 df[col] = df[col].where(df[col].notna(), None)
 
-            logger.debug(f"Final DataFrame before DB insert: {df.head().to_dict(orient='records')}")
-
-            # Insert rows
             rows_inserted = 0
-            for idx, row in df.iterrows():
-                try:
-                    row_values = [row.get(col, None) for col in expected_cols]
-                    cursor.execute(
-                        f"INSERT INTO utb_ImageScraperRecords ({', '.join(expected_cols)}) VALUES ({', '.join(['?'] * len(expected_cols))})",
-                        tuple(row_values)
-                    )
-                    rows_inserted += 1
-                except Exception as e:
-                    logger.error(f"Error inserting row {idx + 1}: {e}")
+            for _, row in df.iterrows():
+                row_values = [row.get(col, None) for col in expected_cols]
+                cursor.execute(f"INSERT INTO utb_ImageScraperRecords ({', '.join(expected_cols)}) VALUES ({', '.join(['?'] * len(expected_cols))})", tuple(row_values))
+                rows_inserted += 1
 
             connection.commit()
             logger.info(f"Committed {rows_inserted} rows into utb_ImageScraperRecords for FileID: {file_id}")
-
-            # Verify insertion
-            cursor.execute(
-                "SELECT FileID, ExcelRowID, ProductModel, ProductBrand, ProductColor, ProductCategory, ExcelRowImageRef "
-                "FROM utb_ImageScraperRecords WHERE FileID = ? ORDER BY ExcelRowID",
-                (file_id,)
-            )
-            inserted_rows = cursor.fetchall()
-            logger.debug(f"All data from DB for FileID {file_id}: {inserted_rows}")
-
-        logger.info(f"Loaded {len(df)} rows into utb_ImageScraperRecords for FileID: {file_id}")
         return df
     except Exception as e:
-        logger.error(f"Error loading payload data: {e}")
+        logger.error(f"Error loading payload data: {e}", exc_info=True)
         raise
 
-
-def insert_file_db(filename: str, file_url: str, email: Optional[str], header_index: int, file_type: int ,logger=None) -> int:
-    logger = logger or default_logger
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        query = """
-            INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl, UserEmail, UserHeaderIndex,FileTypeID, CreateFileStartTime)
-            OUTPUT INSERTED.ID
-            VALUES (?, ?, ?, ?,?, GETDATE())
-        """
-        cursor.execute(query, (filename, file_url, email or 'nik@accessx.com', str(header_index),file_type))
-        row = cursor.fetchone()
-        if row is None or row[0] is None:
-            raise Exception("Insert failed or no identity value returned.")
-        file_id = int(row[0])
-        conn.commit()
-        conn.close()
-        logger.info(f"Inserted file record with ID: {file_id} and header_index: {header_index}")
-        return file_id
-    except pyodbc.Error as e:
-        logger.error(f"Database error: {e}")
-        raise
-    except Exception as e:
-        logger.error(f"Error in insert_file_db: {e}")
-        raise
-
-# ... (Previous imports remain the same, add csv import if needed)
-import csv
-
-# Revised function to insert data into utb_nikofferloadinitial
-# New function to load data into utb_nikofferloadinitial
 def load_nikoffer_db(rows, file_id, headers=None, logger=None):
+    """Loads extracted data into the utb_nikofferloadinitial table."""
     logger = logger or default_logger
     try:
         file_id = int(file_id)
@@ -441,324 +400,176 @@ def load_nikoffer_db(rows, file_id, headers=None, logger=None):
             if cursor.fetchone()[0] == 0:
                 raise ValueError(f"FileID {file_id} not found in utb_ImageScraperFiles")
 
-            # Define columns for utb_nikofferloadinitial
-            nik_columns = ['FileID'] + [f'f{i}' for i in range(41)]  # FileID + f0 to f40
-
+            nik_columns = ['FileID'] + [f'f{i}' for i in range(41)]
             df = pd.DataFrame(rows)
-            logger.debug(f"Raw DataFrame for nikoffer (rows={len(df)}): {df.to_dict(orient='records')}")
-
-            # Use provided headers or DataFrame columns
             file_columns = headers if headers else df.columns.tolist()
-            logger.debug(f"File columns: {file_columns}")
+            mapped_columns = file_columns[:41]
 
-            # Map file columns to f0-f40 (up to 41), pad with None if fewer, truncate if more
-            mapped_columns = file_columns[:41] if len(file_columns) >= 41 else file_columns + [None] * (41 - len(file_columns))
-
-            # Insert rows into utb_nikofferloadinitial
             rows_inserted = 0
-            for idx, row in df.iterrows():
-                try:
-                    # Prepare values: FileID + up to 41 columns, convert to strings to keep original form
-                    row_values = [file_id]
-                    for col in mapped_columns:
-                        if col is None:
-                            row_values.append(None)
-                        else:
-                            value = row.get(col, None)
-                            row_values.append(str(value) if value is not None else None)
-                    
-                    cursor.execute(
-                        f"INSERT INTO utb_nikofferloadinitial ({', '.join(nik_columns)}) "
-                        f"VALUES ({', '.join(['?'] * len(nik_columns))})",
-                        tuple(row_values)
-                    )
-                    rows_inserted += 1
-                except Exception as e:
-                    logger.error(f"Error inserting row {idx + 1} into utb_nikofferloadinitial: {e}")
+            for _, row in df.iterrows():
+                row_values = [file_id]
+                for col in mapped_columns:
+                    value = row.get(col, None)
+                    row_values.append(str(value) if value is not None else None)
+                # Pad if necessary
+                row_values.extend([None] * (len(nik_columns) - len(row_values)))
+                
+                cursor.execute(f"INSERT INTO utb_nikofferloadinitial ({', '.join(nik_columns)}) VALUES ({', '.join(['?'] * len(nik_columns))})", tuple(row_values))
+                rows_inserted += 1
 
             connection.commit()
             logger.info(f"Committed {rows_inserted} rows into utb_nikofferloadinitial for FileID: {file_id}")
-
-            # Verify insertion
-            cursor.execute(
-                f"SELECT FileID, {', '.join([f'f{i}' for i in range(41)])} "
-                f"FROM utb_nikofferloadinitial WHERE FileID = ? ORDER BY FileID",
-                (file_id,)
-            )
-            inserted_rows = cursor.fetchall()
-            logger.debug(f"All data from utb_nikofferloadinitial for FileID {file_id}: {inserted_rows}")
-
-        logger.info(f"Loaded {len(df)} rows into utb_nikofferloadinitial for FileID: {file_id}")
         return df
     except Exception as e:
-        logger.error(f"Error loading nikoffer data: {e}")
+        logger.error(f"Error loading nikoffer data: {e}", exc_info=True)
         raise
 
-# Updated /submitFullFile endpoint for dynamic file uploads
-@app.post("/submitFullFile")
-async def submit_full_file(
-    fileUpload: UploadFile,
-    header_index: int = Form(...),
-    sendToEmail: Optional[str] = Form(None),
-):
-    temp_dir = None
-    extracted_images_dir = None
+def load_offer_import_db(rows, file_id, logger=None):
+    """Loads data from submitted offers into the utb_OfferImport table."""
+    logger = logger or default_logger
     try:
-        file_id = str(uuid.uuid4())
-        default_logger.info(f"Processing full file for FileID: {file_id}")
-        default_logger.info(f"Received: header_index={header_index}, sendToEmail={sendToEmail}")
+        file_id = int(file_id)
+        with get_db_connection() as connection:
+            cursor = connection.cursor()
+            cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
+            if cursor.fetchone()[0] == 0:
+                raise ValueError(f"FileID {file_id} not found in utb_ImageScraperFiles")
 
-        if header_index < 1:
-            raise HTTPException(status_code=400, detail="header_index must be 1 or greater (1-based row number)")
-
-        # Create temporary directory for file processing
-        temp_dir = os.path.join("temp_files", "full_files", file_id)
-        os.makedirs(temp_dir, exist_ok=True)
-        uploaded_file_path = os.path.join(temp_dir, fileUpload.filename)
-        with open(uploaded_file_path, "wb") as buffer:
-            shutil.copyfileobj(fileUpload.file, buffer)
-
-        upload_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        # Upload file to S3 and R2
-        s3_key_excel = f"luxurymarket/supplier/offer/{upload_timestamp}/{file_id}/{fileUpload.filename}"
-        urls = upload_to_s3(
-            uploaded_file_path,
-            S3_CONFIG['bucket_name'],
-            s3_key_excel,
-            r2_bucket_name=S3_CONFIG['r2_bucket_name'],
-            logger=default_logger,
-            file_id=file_id
-        )
-        file_url_s3 = urls['s3']  # S3 URL for database
-        file_url_r2 = urls.get('r2')  # Public R2 URL for response
-        default_logger.info(f"File uploaded to S3: {file_url_s3}")
-        if file_url_r2:
-            default_logger.info(f"File also uploaded to R2: {file_url_r2}")
-
-        # Determine file type and extract data
-        extracted_data = []
-        headers = []
-        file_extension = os.path.splitext(fileUpload.filename)[1].lower()
-
-        if file_extension in ['.xlsx', '.xls']:
-            # Process Excel file
-            wb = load_workbook(uploaded_file_path)
-            sheet = wb.active
-            image_loader = SheetImageLoader(sheet)
-
-            default_logger.info(f"Processing Excel file with header row: {header_index}, max_row: {sheet.max_row}")
-
-            # Get headers
-            for col in sheet[header_index]:
-                headers.append(str(col.value) if col.value else f"Column_{col.column}")
-            default_logger.debug(f"Headers: {headers}")
-
-            # Extract data and images
-            for row_idx in range(header_index + 1, sheet.max_row + 1):
-                default_logger.debug(f"Processing row {row_idx}")
-                row_values = [sheet.cell(row=row_idx, column=col_idx).value for col_idx in range(1, len(headers) + 1)]
-                if all(val is None for val in row_values):
-                    default_logger.info(f"Skipping empty row {row_idx}")
-                    continue
-
-                data = {header: value for header, value in zip(headers, row_values)}
+            offer_columns = ['FileID'] + [f'f{i}' for i in range(41)]
+            df = pd.DataFrame(rows).astype(str).where(pd.notna(rows), None)
+            
+            rows_inserted = 0
+            for _, row in df.iterrows():
+                row_values = [file_id] + list(row.values)[:41]
+                row_values.extend([None] * (len(offer_columns) - len(row_values)))
                 
-                # Check for images in first column (Picture)
-                cell_ref = f"A{row_idx}"
-                extracted_images_dir = os.path.join("temp_files", "extracted_images", file_id)
-                os.makedirs(extracted_images_dir, exist_ok=True)
-                if image_loader.image_in(cell_ref):
-                    img_path = os.path.join(extracted_images_dir, f"image_{file_id}_{cell_ref}.png")
-                    image = image_loader.get(cell_ref)
-                    if image:
-                        image.save(img_path)
-                        s3_key = f"images/{file_id}/{os.path.basename(img_path)}"
-                        img_urls = upload_to_s3(
-                            img_path,
-                            S3_CONFIG['bucket_name'],
-                            s3_key,
-                            r2_bucket_name=S3_CONFIG['r2_bucket_name'],
-                            logger=default_logger,
-                            file_id=file_id
-                        )
-                        image_col = next((h for h in headers if 'image' in h.lower()), 'ExcelRowImageRef')
-                        data[image_col] = img_urls['s3']
-                        default_logger.info(f"Extracted and uploaded image from {cell_ref} to S3: {img_urls['s3']}")
-                        if 'r2' in img_urls:
-                            default_logger.info(f"Image also uploaded to R2: {img_urls['r2']}")
+                cursor.execute(f"INSERT INTO utb_OfferImport ({', '.join(offer_columns)}) VALUES ({', '.join(['?'] * len(offer_columns))})", tuple(row_values))
+                rows_inserted += 1
 
-                extracted_data.append(data)
-                default_logger.info(f"Extracted data for row {row_idx}: {data}")
-
-        elif file_extension == '.csv':
-            # Process CSV file
-            df = pd.read_csv(uploaded_file_path, header=header_index - 1, encoding='utf-8', low_memory=False)
-            df = df.where(pd.notnull(df), None)  # Convert NaN to None
-            headers = [str(col) if col else f"Column_{i+1}" for i, col in enumerate(df.columns)]
-            default_logger.debug(f"Headers: {headers}")
-
-            for idx, row in df.iterrows():
-                if all(val is None for val in row):
-                    default_logger.info(f"Skipping empty row {idx + header_index}")
-                    continue
-                data = {header: row[col] for header, col in zip(headers, df.columns)}
-                extracted_data.append(data)
-                default_logger.info(f"Extracted data for row {idx + header_index}: {data}")
-
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_extension}")
-
-        default_logger.info(f"Total rows extracted (excluding header): {len(extracted_data)}")
-        default_logger.info(f"Extracted for email: {sendToEmail}")
-
-        # Insert file metadata into database
-        file_id_db = insert_file_db(fileUpload.filename, file_url_s3, sendToEmail, header_index, 2, default_logger)
-
-        # Load extracted data into utb_ImageScraperRecords
-        column_map = infer_column_map(extracted_data)
-        load_payload_db(extracted_data, file_id_db, column_map, default_logger)
-
-        # Load extracted data into utb_nikofferloadinitial
-        load_nikoffer_db(extracted_data, file_id_db, headers, default_logger)
-        try:
-            await send_file_details_email(
-                to_email=sendToEmail or "nik@luxurymarket.com",
-                file_id=file_id_db,
-                filename=fileUpload.filename,
-                s3_url=file_url_s3,
-                r2_url=file_url_r2,
-                record_count=len(extracted_data),
-                nikoffer_count=len(extracted_data),  # Assuming same count for nikoffer
-                user_email=sendToEmail or "nik@accessx.com"
-            )
-        except Exception as e:
-            default_logger.error(f"Failed to send notification email: {e}")
-            # Optionally continue despite email failure
-            pass
-        return {
-            "success": True,
-            "s3_url": file_url_s3,
-            "r2_url": file_url_r2,
-            "message": "File uploaded and processed successfully",
-            "file_id": file_id_db
-        }
+            connection.commit()
+            logger.info(f"Committed {rows_inserted} rows into utb_OfferImport for FileID: {file_id}")
+        return df
     except Exception as e:
-        default_logger.error(f"Error processing file: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
-    finally:
-        if temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        if extracted_images_dir and os.path.exists(extracted_images_dir):
-            shutil.rmtree(extracted_images_dir, ignore_errors=True)
-
+        logger.error(f"Error loading offer import data: {e}", exc_info=True)
+        raise
 
 def infer_column_map(extracted_data: List[Dict]) -> Dict[str, str]:
-    """
-    Infer column mappings based on common column names in the extracted data.
-    Returns a column map compatible with load_payload_db.
-    """
+    """Infers column mappings from headers for generic file uploads."""
     if not extracted_data:
-        return {'brand': None, 'style': None, 'image': None, 'color': None, 'category': None}
-
-    # Get the first row to inspect available columns
+        return {}
+    
     columns = list(extracted_data[0].keys())
-    default_logger.debug(f"Inferring column map from columns: {columns}")
-
-    # Common patterns for column names
     patterns = {
-        'style': [r'model', r'style', r'product_model', r'sku', r'item'],
-        'brand': [r'brand', r'manufacturer', r'product_brand'],
-        'color': [r'color', r'colour', r'product_color'],
-        'category': [r'category', r'product_category', r'type'],
+        'style': [r'model', r'style', r'sku', r'item'], 'brand': [r'brand', r'manufacturer'],
+        'color': [r'color', r'colour'], 'category': [r'category', r'type'],
         'image': [r'image', r'photo', r'picture', r'excelrowimageref']
     }
-
-    column_map = {'brand': None, 'style': None, 'image': None, 'color': None, 'category': None}
-    
-    for col in columns:
-        col_lower = col.lower()
-        for field, field_patterns in patterns.items():
-            if any(re.search(pattern, col_lower) for pattern in field_patterns):
-                if not column_map[field]:  # Only assign if not already set
+    column_map = {}
+    for field, field_patterns in patterns.items():
+        for col in columns:
+            if any(re.search(p, col.lower()) for p in field_patterns):
+                if not column_map.get(field):
                     column_map[field] = col
-                    default_logger.debug(f"Mapped column '{col}' to field '{field}'")
-
+                    break
     default_logger.info(f"Inferred column map: {column_map}")
     return column_map
+
+def extract_data_and_images(
+    file_path: str, 
+    file_id: str, 
+    column_map: Dict[str, str], 
+    start_row: int, 
+    manual_brand: Optional[str] = None
+) -> Tuple[List[Dict], Optional[str]]:
+    """Extracts data from an Excel file based on specified column letters, starting from a given row."""
+    wb = load_workbook(file_path)
+    sheet = wb.active
+    image_loader = SheetImageLoader(sheet) if column_map.get('image') else None
+    
+    extracted_images_dir = None
+    if column_map.get('image'):
+        extracted_images_dir = os.path.join("temp_files", "extracted_images", file_id)
+        os.makedirs(extracted_images_dir, exist_ok=True)
+
+    default_logger.info(f"Processing Excel file with data starting at row: {start_row}, max_row: {sheet.max_row}")
+
+    extracted_data = []
+    for row_idx in range(start_row, sheet.max_row + 1):
+        search_val = sheet[f'{column_map["style"]}{row_idx}'].value if column_map.get('style') else None
+        if not search_val: # Skip row if primary search column is empty
+            default_logger.info(f"Skipping row {row_idx} due to empty search column.")
+            continue
+
+        brand = manual_brand if column_map['brand'] == 'MANUAL' else (sheet[f'{column_map["brand"]}{row_idx}'].value if column_map.get('brand') else None)
+        
+        data = {
+            'search': str(search_val),
+            'brand': str(brand) if brand is not None else None,
+            'color': str(sheet[f'{column_map["color"]}{row_idx}'].value) if column_map.get('color') else None,
+            'category': str(sheet[f'{column_map["category"]}{row_idx}'].value) if column_map.get('category') else None,
+            'ExcelRowImageRef': None
+        }
+        
+        if column_map.get('image'):
+            image_cell = f'{column_map["image"]}{row_idx}'
+            image_ref = sheet[image_cell].value
+            if not image_ref and image_loader and image_loader.image_in(image_cell):
+                img_path = os.path.join(extracted_images_dir, f"image_{file_id}_{image_cell}.png")
+                image = image_loader.get(image_cell)
+                if image:
+                    image.save(img_path)
+                    s3_key = f"images/{file_id}/{os.path.basename(img_path)}"
+                    urls = upload_to_s3(img_path, S3_CONFIG['bucket_name'], s3_key, r2_bucket_name=S3_CONFIG['r2_bucket_name'], logger=default_logger, file_id=file_id)
+                    image_ref = urls['s3']
+            data['ExcelRowImageRef'] = image_ref
+
+        extracted_data.append(data)
+    
+    default_logger.info(f"Total rows extracted: {len(extracted_data)}")
+    return extracted_data, extracted_images_dir
 
 def extract_full_data_and_images(
     file_path: str,
     file_id: str,
     header_row: int
-) -> Tuple[List[Dict], Optional[str]]:
-    """
-    Extract all data and images from an Excel file without specific column targets.
-    """
+) -> Tuple[List[Dict], List[str], Optional[str]]:
+    """Extracts all data and images from an Excel file, using a header row to define columns."""
     wb = load_workbook(file_path)
     sheet = wb.active
-    image_loader = SheetImageLoader(sheet)  # Always check for images
-
+    image_loader = SheetImageLoader(sheet)
     extracted_images_dir = os.path.join("temp_files", "extracted_images", file_id)
     os.makedirs(extracted_images_dir, exist_ok=True)
-
-    header_idx = header_row
-    default_logger.info(f"Processing Excel file with header row: {header_idx}, max_row: {sheet.max_row}")
-
-    # Get headers
-    headers = []
-    for col in sheet[header_idx]:
-        if col.value:
-            headers.append(str(col.value))
-        else:
-            headers.append(f"Column_{col.column}")  # Fallback for empty headers
-    default_logger.debug(f"Headers: {headers}")
-
+    
+    headers = [str(col.value) if col.value else f"Column_{col.column}" for col in sheet[header_row]]
+    
     extracted_data = []
     for row_idx in range(header_row + 1, sheet.max_row + 1):
-        default_logger.debug(f"Processing row {row_idx}")
-        # Check if row is empty
-        row_values = [sheet.cell(row=row_idx, column=col_idx).value for col_idx in range(1, len(headers) + 1)]
+        row_values = [sheet.cell(row=row_idx, column=col_idx + 1).value for col_idx in range(len(headers))]
         if all(val is None for val in row_values):
-            default_logger.info(f"Skipping empty row {row_idx}")
             continue
-
-        data = {header: None for header in headers}
+        
+        data = dict(zip(headers, row_values))
+        
         for col_idx, header in enumerate(headers, start=1):
             cell = sheet.cell(row=row_idx, column=col_idx)
             cell_ref = f"{cell.column_letter}{row_idx}"
-            data[header] = cell.value
-
-            # Check for images in the cell
             if image_loader.image_in(cell_ref):
                 img_path = os.path.join(extracted_images_dir, f"image_{file_id}_{cell_ref}.png")
                 image = image_loader.get(cell_ref)
                 if image:
                     image.save(img_path)
                     s3_key = f"images/{file_id}/{os.path.basename(img_path)}"
-                    urls = upload_to_s3(
-                        img_path,
-                        S3_CONFIG['bucket_name'],
-                        s3_key,
-                        r2_bucket_name=S3_CONFIG['r2_bucket_name'],
-                        logger=default_logger,
-                        file_id=file_id
-                    )
-                    # Store image URL in a dedicated column if not already present
+                    urls = upload_to_s3(img_path, S3_CONFIG['bucket_name'], s3_key, r2_bucket_name=S3_CONFIG['r2_bucket_name'], logger=default_logger, file_id=file_id)
                     image_col = next((h for h in headers if 'image' in h.lower()), 'ExcelRowImageRef')
-                    if image_col not in data:
-                        data[image_col] = urls['s3']
-                    else:
-                        data[image_col] = urls['s3']
-                    default_logger.info(f"Extracted and uploaded image from {cell_ref} to S3: {urls['s3']}")
-                    if 'r2' in urls:
-                        default_logger.info(f"Image also uploaded to R2: {urls['r2']}")
-
+                    if image_col not in headers: headers.append(image_col)
+                    data[image_col] = urls['s3']
         extracted_data.append(data)
-        default_logger.info(f"Extracted data for row {row_idx}: {data}")
+        
+    return extracted_data, headers, extracted_images_dir
 
-    default_logger.info(f"Total rows extracted (excluding header): {len(extracted_data)}")
-    return extracted_data, extracted_images_dir
-# Updated /submitImage endpoint
+
+# --- API Endpoints ---
+
 @app.post("/submitImage")
 async def submit_image(
     fileUploadImage: UploadFile,
@@ -771,567 +582,96 @@ async def submit_image(
     sendToEmail: Optional[str] = Form(None),
     manualBrand: Optional[str] = Form(None),
 ):
+    """Processes an Excel file with specific column mappings for image scraping."""
     temp_dir = None
-    extracted_images_dir = None
     try:
         file_id = str(uuid.uuid4())
-        default_logger.info(f"Processing file for FileID: {file_id}")
-        default_logger.info(f"Received: brandColImage={brandColImage}, manualBrand={manualBrand}, "
-                           f"searchColImage={searchColImage}, imageColumnImage={imageColumnImage}, "
-                           f"ColorColImage={ColorColImage}, CategoryColImage={CategoryColImage}, "
-                           f"header_index={header_index}")
-
         if header_index < 1:
-            raise HTTPException(status_code=400, detail="header_index must be 1 or greater (1-based row number)")
-
+            raise HTTPException(status_code=400, detail="header_index must be 1 or greater (1-based row number for start of data).")
+        
         temp_dir = os.path.join("temp_files", "images", file_id)
         os.makedirs(temp_dir, exist_ok=True)
         uploaded_file_path = os.path.join(temp_dir, fileUploadImage.filename)
         with open(uploaded_file_path, "wb") as buffer:
             shutil.copyfileobj(fileUploadImage.file, buffer)
 
-        s3_key_excel = f"uploads/{file_id}/{fileUploadImage.filename}"
-        urls = upload_to_s3(
-            uploaded_file_path, 
-            S3_CONFIG['bucket_name'], 
-            s3_key_excel, 
-            r2_bucket_name=S3_CONFIG['r2_bucket_name'],
-            logger=default_logger,
-            file_id=file_id
-        )
-        file_url_s3 = urls['s3']  # S3 URL for database
-        file_url_r2 = urls.get('r2')  # Public R2 URL for response
-        default_logger.info(f"Excel file uploaded to S3: {file_url_s3}")
-        if file_url_r2:
-            default_logger.info(f"Excel file also uploaded to R2: {file_url_r2}")
-
-        extract_column_map = {
-            'brand': 'MANUAL' if brandColImage == 'MANUAL' else validate_column(brandColImage),
-            'style': validate_column(searchColImage),
-            'image': validate_column(imageColumnImage) if imageColumnImage else None,
-            'color': validate_column(ColorColImage) if ColorColImage else None,
-            'category': validate_column(CategoryColImage) if CategoryColImage else None,
-            'manualBrand': manualBrand
+        s3_key = f"uploads/{file_id}/{fileUploadImage.filename}"
+        urls = upload_to_s3(uploaded_file_path, S3_CONFIG['bucket_name'], s3_key, S3_CONFIG['r2_bucket_name'], default_logger, file_id)
+        
+        column_map = {
+            'brand': 'MANUAL' if brandColImage == 'MANUAL' else validate_column(brandColImage), 'style': validate_column(searchColImage),
+            'image': validate_column(imageColumnImage) if imageColumnImage else None, 'color': validate_column(ColorColImage) if ColorColImage else None,
+            'category': validate_column(CategoryColImage) if CategoryColImage else None, 'manualBrand': manualBrand
         }
-        default_logger.info(f"Column map: {extract_column_map}")
-
-        if extract_column_map['brand'] == 'MANUAL' and not manualBrand:
+        if column_map['brand'] == 'MANUAL' and not manualBrand:
             raise HTTPException(status_code=400, detail="manualBrand is required when brandColImage is 'MANUAL'")
 
-        extracted_data, extracted_images_dir = extract_data_and_images(
-            uploaded_file_path, file_id, extract_column_map, header_index,
-            manualBrand if extract_column_map['brand'] == 'MANUAL' else None
+        extracted_data, _ = extract_data_and_images(uploaded_file_path, file_id, column_map, header_index, manualBrand)
+        
+        file_id_db = insert_file_db(fileUploadImage.filename, urls['s3'], sendToEmail, header_index, 1, default_logger)
+        load_payload_db(extracted_data, file_id_db, column_map, default_logger)
+        
+        await send_file_details_email(
+            sendToEmail or "nik@luxurymarket.com", file_id_db, fileUploadImage.filename,
+            urls['s3'], urls.get('r2'), len(extracted_data), 0, sendToEmail
         )
-        default_logger.debug(f"Extracted data: {extracted_data}")
-        default_logger.info(f"Extracted for email: {sendToEmail}")
-
-        file_id_db = insert_file_db(fileUploadImage.filename, file_url_s3, sendToEmail, header_index, 1, default_logger)
-
-        load_payload_db(extracted_data, file_id_db, extract_column_map, default_logger)
-        try:
-            await send_file_details_email(
-                to_email=sendToEmail or "nik@luxurymarket.com",
-                file_id=file_id_db,
-                filename=fileUploadImage.filename,
-                s3_url=file_url_s3,
-                r2_url=file_url_r2,
-                record_count=len(extracted_data),
-                nikoffer_count=len(extracted_data),  # Assuming same count for nikoffer
-                user_email=sendToEmail or "nik@accessx.com"
-            )
-        except Exception as e:
-            default_logger.error(f"Failed to send notification email: {e}")
-            # Optionally continue despite email failure
-            pass
-        return {
-            "success": True,
-            "s3_url": file_url_s3,
-            "r2_url": file_url_r2,
-            "message": "File uploaded and processed successfully",
-            "file_id": file_id_db
-        }
+        return {"success": True, "s3_url": urls['s3'], "r2_url": urls.get('r2'), "file_id": file_id_db}
     except Exception as e:
-        default_logger.error(f"Error processing file: {e}", exc_info=True)
+        default_logger.error(f"Error in /submitImage: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
     finally:
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
-        if extracted_images_dir and os.path.exists(extracted_images_dir):
-            shutil.rmtree(extracted_images_dir, ignore_errors=True)
 
-def extract_data_and_images(
-    file_path: str, 
-    file_id: str, 
-    column_map: Dict[str, str], 
-    header_row: int, 
-    manual_brand: Optional[str] = None
-) -> Tuple[List[Dict], Optional[str]]:
-    wb = load_workbook(file_path)
-    sheet = wb.active
-    image_loader = SheetImageLoader(sheet) if column_map.get('image') else None
-
-    extracted_images_dir = None
-    if column_map.get('image'):
-        extracted_images_dir = os.path.join("temp_files", "extracted_images", file_id)
-        os.makedirs(extracted_images_dir, exist_ok=True)
-
-    header_idx = header_row 
-    default_logger.info(f"Processing Excel file with header row: {header_idx}, max_row: {sheet.max_row}")
-
-    # Define valid columns, excluding 'MANUAL' and manualBrand
-    valid_columns = [col for col in column_map.values() if col and col != 'MANUAL' and col != manual_brand]
-    default_logger.debug(f"Valid columns: {valid_columns}")
-
-    header_data = {
-        'search': sheet[f'{column_map["style"]}{header_idx}'].value if column_map.get('style') else None,
-        'brand': manual_brand if column_map.get('brand') == 'MANUAL' else (
-            sheet[f'{column_map["brand"]}{header_idx}'].value if column_map.get('brand') else None
-        ),
-        'color': sheet[f'{column_map["color"]}{header_idx}'].value if column_map.get('color') else None,
-        'category': sheet[f'{column_map["category"]}{header_idx}'].value if column_map.get('category') else None,
-    }
-    default_logger.info(f"Header row {header_idx} data: {header_data}")
-
-    extracted_data = []
-    for row_idx in range(header_row + 1, sheet.max_row + 1):
-        default_logger.debug(f"Processing row {row_idx}")
-        # Skip rows where all specified columns are empty
-        row_is_empty = False
-        if valid_columns:
-            try:
-                cell_values = [sheet[f'{col}{row_idx}'].value for col in valid_columns]
-                row_is_empty = all(val is None for val in cell_values)
-                default_logger.debug(f"Row {row_idx} cell values: {dict(zip(valid_columns, cell_values))}")
-            except ValueError as e:
-                default_logger.error(f"Invalid cell reference in row {row_idx}: {str(e)}")
-                raise HTTPException(status_code=400, detail=f"Invalid cell reference in row {row_idx}: {str(e)}")
+@app.post("/submitFullFile")
+async def submit_full_file(
+    fileUpload: UploadFile,
+    header_index: int = Form(...),
+    sendToEmail: Optional[str] = Form(None),
+):
+    """Processes a generic file (XLSX or CSV) by extracting all columns and storing them."""
+    temp_dir = None
+    try:
+        file_id = str(uuid.uuid4())
+        if header_index < 1:
+            raise HTTPException(status_code=400, detail="header_index must be 1 or greater.")
         
-        if row_is_empty:
-            default_logger.info(f"Skipping empty row {row_idx}")
-            continue
+        temp_dir = os.path.join("temp_files", "full_files", file_id)
+        os.makedirs(temp_dir, exist_ok=True)
+        uploaded_file_path = os.path.join(temp_dir, fileUpload.filename)
+        with open(uploaded_file_path, "wb") as buffer:
+            shutil.copyfileobj(fileUpload.file, buffer)
+        
+        s3_key = f"luxurymarket/supplier/offer/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}/{file_id}/{fileUpload.filename}"
+        urls = upload_to_s3(uploaded_file_path, S3_CONFIG['bucket_name'], s3_key, S3_CONFIG['r2_bucket_name'], default_logger, file_id)
+        
+        file_extension = os.path.splitext(fileUpload.filename)[1].lower()
+        if file_extension in ['.xlsx', '.xls']:
+            extracted_data, headers, _ = extract_full_data_and_images(uploaded_file_path, file_id, header_index)
+        elif file_extension == '.csv':
+            df = pd.read_csv(uploaded_file_path, header=header_index - 1, encoding='utf-8', low_memory=False).where(pd.notnull(df), None)
+            headers = [str(col) if col else f"Column_{i+1}" for i, col in enumerate(df.columns)]
+            extracted_data = df.to_dict(orient='records')
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_extension}")
 
-        image_ref = None
-        if column_map.get('image'):
-            image_cell = f'{column_map["image"]}{row_idx}'
-            try:
-                image_ref = sheet[image_cell].value if sheet[image_cell] else None
-                default_logger.debug(f"Image cell {image_cell} value: {image_ref}")
-            except ValueError:
-                default_logger.error(f"Invalid image cell reference: {image_cell}")
-                image_ref = None
-
-        brand = manual_brand if column_map['brand'] == 'MANUAL' else (
-            sheet[f'{column_map["brand"]}{row_idx}'].value 
-            if column_map.get('brand') and column_map['brand'] != 'MANUAL' else None
+        file_id_db = insert_file_db(fileUpload.filename, urls['s3'], sendToEmail, header_index, 2, default_logger)
+        
+        column_map = infer_column_map(extracted_data)
+        load_payload_db(extracted_data, file_id_db, column_map, default_logger)
+        load_nikoffer_db(extracted_data, file_id_db, headers, default_logger)
+        
+        await send_file_details_email(
+            sendToEmail or "nik@luxurymarket.com", file_id_db, fileUpload.filename,
+            urls['s3'], urls.get('r2'), len(extracted_data), len(extracted_data), sendToEmail
         )
-
-        data = {
-            'search': (
-                str(sheet[f'{column_map["style"]}{row_idx}'].value) 
-                if column_map.get('style') else None
-            ),
-            'brand': str(brand) if brand is not None else None,
-            'ExcelRowImageRef': image_ref,
-            'color': (
-                str(sheet[f'{column_map["color"]}{row_idx}'].value) 
-                if column_map.get('color') else None
-            ),
-            'category': (
-                str(sheet[f'{column_map["category"]}{row_idx}'].value) 
-                if column_map.get('category') else None
-            ),
-        }
-        default_logger.info(f"Extracted data for row {row_idx}: {data}")
-
-        if column_map.get('image') and not data['ExcelRowImageRef'] and image_loader and image_loader.image_in(image_cell):
-            img_path = os.path.join(extracted_images_dir, f"image_{file_id}_{image_cell}.png")
-            image = image_loader.get(image_cell)
-            if image:
-                image.save(img_path)
-                s3_key = f"images/{file_id}/{os.path.basename(img_path)}"
-                urls = upload_to_s3(
-                    img_path, 
-                    S3_CONFIG['bucket_name'], 
-                    s3_key,
-                    r2_bucket_name=S3_CONFIG['r2_bucket_name'],
-                    logger=default_logger,
-                    file_id=file_id
-                )
-                data['ExcelRowImageRef'] = urls['s3']  # Use S3 URL for database
-                default_logger.info(f"Extracted and uploaded image from {image_cell} to S3: {urls['s3']}")
-                if 'r2' in urls:
-                    default_logger.info(f"Image also uploaded to R2: {urls['r2']}")
-            else:
-                default_logger.warning(f"No image retrieved from cell {image_cell}")
-
-        extracted_data.append(data)
-
-    default_logger.info(f"Total rows extracted (excluding header): {len(extracted_data)}")
-    return extracted_data, extracted_images_dir
-
-@app.api_route("/api/update-references", methods=["GET", "POST"], response_model=ReferenceData)
-async def update_references(updated_data: Optional[ReferenceData] = None):
-    github_url = "https://raw.githubusercontent.com/iconluxurygroup/settings-static-data/refs/heads/main/optimal-references.json"
-    s3_key = "optimal-references.json"
-
-    if updated_data is None:  # GET request
-        try:
-            response = requests.get(github_url)
-            if response.status_code != 200:
-                raise HTTPException(status_code=500, detail="Failed to fetch data from GitHub")
-            data = response.json()
-            return ReferenceData(data=data)
-        except Exception as e:
-            default_logger.error(f"Error fetching from GitHub: {e}")
-            raise HTTPException(status_code=500, detail=f"Error fetching data: {str(e)}")
-
-    else:  # POST request
-        try:
-            if not updated_data.data:
-                raise HTTPException(status_code=400, detail="Data cannot be empty")
-            if len(updated_data.data) != len(set(updated_data.data.keys())):
-                raise HTTPException(status_code=400, detail="Duplicate categories are not allowed")
-            if any(not key or not value for key, value in updated_data.data.items()):
-                raise HTTPException(status_code=400, detail="All fields must be non-empty")
-
-            temp_file = "temp_references.json"
-            with open(temp_file, "w") as f:
-                json.dump(updated_data.data, f)
-
-            urls = upload_to_s3(
-                temp_file,
-                S3_CONFIG["bucket_name"],
-                s3_key,
-                r2_bucket_name=S3_CONFIG['r2_bucket_name'],
-                logger=default_logger
-            )
-            s3_url = urls['s3']
-            default_logger.info(f"Uploaded updated references to S3: {s3_url}")
-            if 'r2' in urls:
-                default_logger.info(f"References also uploaded to R2: {urls['r2']}")
-
-            os.remove(temp_file)
-
-            return ReferenceData(data=updated_data.data)
-        except Exception as e:
-            default_logger.error(f"Error uploading to S3/R2: {e}")
-            raise HTTPException(status_code=500, detail=f"Error saving data: {str(e)}")
-
-@app.get("/api/scraping-jobs", response_model=list[JobSummary])
-async def get_all_jobs(page: int = 1, page_size: int = 10):
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        offset = (page - 1) * page_size
-
-        query = """
-            SELECT 
-                ID, 
-                FileName, 
-                CreateFileCompleteTime, 
-                UserEmail,
-                (SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = utb_ImageScraperFiles.ID) as rec_count,
-                (SELECT COUNT(*) FROM utb_ImageScraperResult 
-                 WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = utb_ImageScraperFiles.ID)) as img_count
-            FROM utb_ImageScraperFiles
-            WHERE FileTypeID = 1
-            ORDER BY ID DESC
-            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
-        """
-        cursor.execute(query, (offset, page_size))
-        rows = cursor.fetchall()
-
-        jobs_data = [
-            {
-                "id": row.ID,
-                "inputFile": row.FileName,
-                "fileEnd": row.CreateFileCompleteTime.isoformat() if row.CreateFileCompleteTime else None,
-                "user": row.UserEmail or "Unknown",
-                "rec": row.rec_count,
-                "img": row.img_count,
-            }
-            for row in rows
-        ]
-
-        conn.close()
-        return jobs_data
+        return {"success": True, "s3_url": urls['s3'], "r2_url": urls.get('r2'), "file_id": file_id_db}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/scraping-jobs/{job_id}", response_model=JobDetails)
-async def get_job(job_id: int):
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        query_files = """
-            SELECT ID, FileName, ImageStartTime, CreateFileStartTime, CreateFileCompleteTime,
-                   FileLocationURLComplete AS ResultFile, FileLocationUrl, LogFileURL, UserEmail,
-                   ImageCompleteTime
-            FROM utb_ImageScraperFiles
-            WHERE ID = ?
-        """
-        cursor.execute(query_files, (job_id,))
-        row = cursor.fetchone()
-
-        if not row:
-            raise HTTPException(status_code=404, detail="Job not found")
-
-        query_results = """
-            SELECT ResultID, EntryID, ImageUrl, ImageDesc, ImageSource, CreateTime, ImageUrlThumbnail,
-                   SortOrder, ImageIsFashion, AiCaption, AiJson, AiLabel
-            FROM utb_ImageScraperResult
-            WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?)
-        """
-        cursor.execute(query_results, (job_id,))
-        results = cursor.fetchall()
-
-        query_records = """
-            SELECT EntryID, FileID, ExcelRowID, ProductModel, ProductBrand, CreateTime, Step1, Step2, 
-                   Step3, Step4, CompleteTime, ProductColor, ProductCategory, excelRowImageRef
-            FROM utb_ImageScraperRecords
-            WHERE FileID = ?
-        """
-        cursor.execute(query_records, (job_id,))
-        records = cursor.fetchall()
-
-        job_data = {
-            "id": row.ID,
-            "inputFile": row.FileName,
-            "imageStart": row.ImageStartTime.isoformat() if row.ImageStartTime else None,
-            "fileStart": row.CreateFileStartTime.isoformat() if row.CreateFileStartTime else None,
-            "fileEnd": row.CreateFileCompleteTime.isoformat() if row.CreateFileCompleteTime else None,
-            "resultFile": row.ResultFile,
-            "fileLocationUrl": row.FileLocationUrl,
-            "logFileUrl": row.LogFileURL,
-            "user": row.UserEmail or "Unknown",
-            "rec": len(records),
-            "img": len(results),
-            "apiUsed": "google-serp",
-            "imageEnd": row.ImageCompleteTime.isoformat() if row.ImageCompleteTime else None,
-            "results": [
-                {
-                    "resultId": r.ResultID,
-                    "entryId": r.EntryID,
-                    "imageUrl": r.ImageUrl or "None",
-                    "imageDesc": r.ImageDesc,
-                    "imageSource": r.ImageSource,
-                    "createTime": r.CreateTime.isoformat() if r.CreateTime else None,
-                    "imageUrlThumbnail": r.ImageUrlThumbnail or "None",
-                    "sortOrder": r.SortOrder or -1,
-                    "imageIsFashion": r.ImageIsFashion,
-                    "aiCaption": r.AiCaption,
-                    "aiJson": r.AiJson,
-                    "aiLabel": r.AiLabel,
-                } for r in results
-            ],
-            "records": [
-                {
-                    "entryId": r.EntryID,
-                    "fileId": r.FileID,
-                    "excelRowId": r.ExcelRowID,
-                    "productModel": r.ProductModel,
-                    "productBrand": r.ProductBrand,
-                    "createTime": r.CreateTime.isoformat() if r.CreateTime else None,
-                    "step1": r.Step1.isoformat() if r.Step1 else None,
-                    "step2": r.Step2.isoformat() if r.Step2 else None,
-                    "step3": r.Step3.isoformat() if r.Step3 else None,
-                    "step4": r.Step4.isoformat() if r.Step4 else None,
-                    "completeTime": r.CompleteTime.isoformat() if r.CompleteTime else None,
-                    "productColor": r.ProductColor if r.ProductColor else None,
-                    "productCategory": r.ProductCategory if r.ProductCategory else None,
-                    "excelRowImageRef": r.excelRowImageRef if r.excelRowImageRef else None,
-                } for r in records
-            ],
-        }
-
-        conn.close()
-        return job_data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/whitelist-domains", response_model=List[DomainAggregation])
-async def get_whitelist_domains():
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        query = """
-            SELECT ImageSource, SortOrder
-            FROM utb_ImageScraperResult
-        """
-        cursor.execute(query)
-        rows = cursor.fetchall()
-
-        domain_data = {}
-        for row in rows:
-            image_source = row.ImageSource if row.ImageSource else "unknown"
-            sort_order = row.SortOrder if row.SortOrder is not None else -1
-
-            try:
-                from urllib.parse import urlparse
-                domain = urlparse(image_source).hostname or "unknown"
-                domain = domain.replace("www.", "")
-            except:
-                domain = "unknown"
-
-            if domain not in domain_data:
-                domain_data[domain] = {"totalResults": 0, "positiveSortOrderCount": 0}
-            
-            domain_data[domain]["totalResults"] += 1
-            if sort_order > 0:
-                domain_data[domain]["positiveSortOrderCount"] += 1
-
-        aggregated_domains = [
-            {
-                "domain": domain,
-                "totalResults": data["totalResults"],
-                "positiveSortOrderCount": data["positiveSortOrderCount"],
-            }
-            for domain, data in domain_data.items()
-        ]
-
-        conn.close()
-        return aggregated_domains
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# Response model for supplier offer summary
-class OfferSummary(BaseModel):
-    id: int
-    fileName: str
-    fileLocationUrl: str
-    userEmail: Optional[str]
-    createTime: Optional[str]
-    recordCount: int
-    nikOfferCount: int
-
-# Response model for detailed offer data
-class OfferDetails(BaseModel):
-    id: int
-    fileName: str
-    fileLocationUrl: str
-    userEmail: Optional[str]
-    createTime: Optional[str]
-    recordCount: int
-    nikOfferCount: int
-    sampleRecords: List[dict]
-    sampleNikOffers: List[dict]
-
-# Endpoint to list supplier offers
-@app.get("/api/luxurymarket/supplier/offers", response_model=List[OfferSummary])
-async def list_supplier_offers(page: int = 1, page_size: int = 10):
-    """
-    List supplier offers with pagination.
-    Returns a list of offers with metadata and counts of associated records.
-    """
-    try:
-        default_logger.info(f"Fetching supplier offers: page={page}, page_size={page_size}")
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        offset = (page - 1) * page_size
-
-        query = """
-            SELECT 
-                ID, 
-                FileName, 
-                FileLocationUrl, 
-                UserEmail, 
-                CreateFileStartTime,
-                (SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = utb_ImageScraperFiles.ID) as record_count,
-                (SELECT COUNT(*) FROM utb_nikofferloadinitial WHERE FileID = utb_ImageScraperFiles.ID) as nikoffer_count
-            FROM utb_ImageScraperFiles
-            WHERE FileTypeID = 2
-            ORDER BY CreateFileStartTime DESC
-            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
-        """
-        cursor.execute(query, (offset, page_size))
-        rows = cursor.fetchall()
-
-        offers = [
-            OfferSummary(
-                id=row.ID,
-                fileName=row.FileName,
-                fileLocationUrl=row.FileLocationUrl,
-                userEmail=row.UserEmail,
-                createTime=row.CreateFileStartTime.isoformat() if row.CreateFileStartTime else None,
-                recordCount=row.record_count,
-                nikOfferCount=row.nikoffer_count
-            )
-            for row in rows
-        ]
-
-        default_logger.info(f"Retrieved {len(offers)} supplier offers")
-        conn.close()
-        return offers
-    except Exception as e:
-        default_logger.error(f"Error listing supplier offers: {e}", exc_info=True)
+        default_logger.error(f"Error in /submitFullFile: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
-# Add to imports if not already present
-from pathlib import Path
-import uuid
-import urllib.parse
-
-# New function to load data into utb_OfferImport
-def load_offer_import_db(rows, file_id, logger=None):
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        with get_db_connection() as connection:
-            cursor = connection.cursor()
-            cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
-            if cursor.fetchone()[0] == 0:
-                raise ValueError(f"FileID {file_id} not found in utb_ImageScraperFiles")
-
-            # Define columns for utb_OfferImport (assuming up to 41 columns like utb_nikofferloadinitial)
-            offer_columns = ['FileID'] + [f'f{i}' for i in range(41)]  # FileID + f0 to f40
-
-            # Convert rows to DataFrame for processing
-            df = pd.DataFrame(rows)
-            logger.debug(f"Raw DataFrame for utb_OfferImport (rows={len(df)}): {df.to_dict(orient='records')}")
-
-            # Ensure all values are strings or None to preserve original format
-            df = df.astype(str).where(df.notna(), None)
-
-            # Insert rows into utb_OfferImport
-            rows_inserted = 0
-            for idx, row in df.iterrows():
-                try:
-                    # Prepare values: FileID + up to 41 columns
-                    row_values = [file_id] + [row.get(i, None) for i in range(min(len(row), 41))]
-                    # Pad with None if fewer than 41 columns
-                    row_values += [None] * (42 - len(row_values))
-                    
-                    cursor.execute(
-                        f"INSERT INTO utb_OfferImport ({', '.join(offer_columns)}) "
-                        f"VALUES ({', '.join(['?'] * len(offer_columns))})",
-                        tuple(row_values)
-                    )
-                    rows_inserted += 1
-                except Exception as e:
-                    logger.error(f"Error inserting row {idx + 1} into utb_OfferImport: {e}")
-
-            connection.commit()
-            logger.info(f"Committed {rows_inserted} rows into utb_OfferImport for FileID: {file_id}")
-
-            # Verify insertion
-            cursor.execute(
-                f"SELECT FileID, {', '.join([f'f{i}' for i in range(41)])} "
-                f"FROM utb_OfferImport WHERE FileID = ? ORDER BY FileID",
-                (file_id,)
-            )
-            inserted_rows = cursor.fetchall()
-            logger.debug(f"All data from utb_OfferImport for FileID {file_id}: {inserted_rows}")
-
-        logger.info(f"Loaded {len(df)} rows into utb_OfferImport for FileID: {file_id}")
-        return df
-    except Exception as e:
-        logger.error(f"Error loading offer import data: {e}")
-        raise
+    finally:
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 @app.post("/submitOffer")
 async def submit_offer(
@@ -1339,290 +679,200 @@ async def submit_offer(
     header_index: int = Form(...),
     sendToEmail: Optional[str] = Form(None),
 ):
+    """Downloads a file from a URL, processes it, and stores the raw data."""
     temp_dir = None
-    extracted_images_dir = None
     try:
         file_id = str(uuid.uuid4())
-        default_logger.info(f"Processing offer file for FileID: {file_id}")
-        default_logger.info(f"Received: fileUrl={fileUrl}, header_index={header_index}, sendToEmail={sendToEmail}")
-
         if header_index < 1:
-            raise HTTPException(status_code=400, detail="header_index must be 1 or greater (1-based row number)")
-
-        # Create temporary directory for file processing
+            raise HTTPException(status_code=400, detail="header_index must be 1 or greater.")
+        
         temp_dir = os.path.join("temp_files", "offers", file_id)
         os.makedirs(temp_dir, exist_ok=True)
 
-        # Download the file
         response = requests.get(fileUrl)
-        if response.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"Failed to download file from {fileUrl}")
-
-        # Extract filename from URL
-        parsed_url = urllib.parse.urlparse(fileUrl)
-        filename = os.path.basename(parsed_url.path)
-        if not filename:
-            raise HTTPException(status_code=400, detail="Could not determine filename from URL")
-
+        response.raise_for_status()
+        filename = os.path.basename(urllib.parse.urlparse(fileUrl).path) or f"offer_{file_id}.tmp"
+        
         uploaded_file_path = os.path.join(temp_dir, filename)
         with open(uploaded_file_path, "wb") as f:
             f.write(response.content)
-        default_logger.info(f"Downloaded file to {uploaded_file_path}")
 
-        upload_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        # Upload file to S3 and R2
-        s3_key_excel = f"luxurymarket/supplier/offer/{upload_timestamp}/{file_id}/{filename}"
-        urls = upload_to_s3(
-            uploaded_file_path,
-            S3_CONFIG['bucket_name'],
-            s3_key_excel,
-            r2_bucket_name=S3_CONFIG['r2_bucket_name'],
-            logger=default_logger,
-            file_id=file_id
-        )
-        file_url_s3 = urls['s3']  # S3 URL for database
-        file_url_r2 = urls.get('r2')  # Public R2 URL for response
-        default_logger.info(f"File uploaded to S3: {file_url_s3}")
-        if file_url_r2:
-            default_logger.info(f"File also uploaded to R2: {file_url_r2}")
+        s3_key = f"luxurymarket/supplier/offer/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}/{file_id}/{filename}"
+        urls = upload_to_s3(uploaded_file_path, S3_CONFIG['bucket_name'], s3_key, S3_CONFIG['r2_bucket_name'], default_logger, file_id)
 
-        # Determine file type and process data
-        extracted_data = []
         file_extension = os.path.splitext(filename)[1].lower()
-
         if file_extension in ['.xlsx', '.xls']:
-            # Process Excel file
             wb = load_workbook(uploaded_file_path)
             sheet = wb.active
-
-            default_logger.info(f"Processing Excel file, max_row: {sheet.max_row}")
-
-            # Create directory for extracted images
-            extracted_images_dir = os.path.join("temp_files", "extracted_images", file_id)
-            os.makedirs(extracted_images_dir, exist_ok=True)
-
-            # Read all rows starting from row 1 (no header processing)
-            for row_idx in range(1, sheet.max_row + 1):
-                row_values = [sheet.cell(row=row_idx, column=col_idx).value for col_idx in range(1, sheet.max_column + 1)]
-                # Skip empty rows
-                if all(val is None or str(val).strip() == '' for val in row_values):
-                    default_logger.info(f"Skipping empty row {row_idx}")
-                    continue
-
-                # Check for image filename in first column
-                if row_values[0] and isinstance(row_values[0], str) and re.match(r'.+\.(png|jpg|jpeg|gif)$', row_values[0], re.IGNORECASE):
-                    image_filename = row_values[0]
-                    image_path = os.path.join(extracted_images_dir, image_filename)
-                    # Assume image file exists in the same directory as the uploaded file or needs to be provided
-                    # For this implementation, we'll assume the image is accessible locally or needs to be downloaded
-                    # If images are in the same directory as the file, adjust the path accordingly
-                    if os.path.exists(image_path):
-                        s3_key = f"images/{file_id}/{image_filename}"
-                        img_urls = upload_to_s3(
-                            image_path,
-                            S3_CONFIG['bucket_name'],
-                            s3_key,
-                            r2_bucket_name=S3_CONFIG['r2_bucket_name'],
-                            logger=default_logger,
-                            file_id=file_id
-                        )
-                        # Replace the image filename with the R2 URL
-                        row_values[0] = img_urls.get('r2', img_urls['s3'])
-                        default_logger.info(f"Uploaded image {image_filename} to R2: {row_values[0]}")
-                    else:
-                        default_logger.warning(f"Image file {image_filename} not found at {image_path}")
-
-                extracted_data.append(row_values)
-                default_logger.info(f"Extracted data for row {row_idx}: {row_values}")
-
+            extracted_data = [
+                [cell.value for cell in row]
+                for row_idx, row in enumerate(sheet.iter_rows(), 1)
+                if row_idx >= header_index and not all(c.value is None for c in row)
+            ]
         elif file_extension == '.csv':
-            # Process CSV file
-            with open(uploaded_file_path, 'r', encoding='utf-8') as csv_file:
-                csv_reader = csv.reader(csv_file)
-                for row_idx, row in enumerate(csv_reader, start=1):
-                    # Skip empty rows
-                    row_values = [val if val.strip() != '' else None for val in row]
-                    if all(val is None for val in row_values):
-                        default_logger.info(f"Skipping empty row {row_idx}")
-                        continue
-
-                    # Check for image filename in first column
-                    if row_values[0] and re.match(r'.+\.(png|jpg|jpeg|gif)$', row_values[0], re.IGNORECASE):
-                        image_filename = row_values[0]
-                        image_path = os.path.join(extracted_images_dir or temp_dir, image_filename)
-                        if os.path.exists(image_path):
-                            s3_key = f"images/{file_id}/{image_filename}"
-                            img_urls = upload_to_s3(
-                                image_path,
-                                S3_CONFIG['bucket_name'],
-                                s3_key,
-                                r2_bucket_name=S3_CONFIG['r2_bucket_name'],
-                                logger=default_logger,
-                                file_id=file_id
-                            )
-                            # Replace the image filename with the R2 URL
-                            row_values[0] = img_urls.get('r2', img_urls['s3'])
-                            default_logger.info(f"Uploaded image {image_filename} to R2: {row_values[0]}")
-                        else:
-                            default_logger.warning(f"Image file {image_filename} not found at {image_path}")
-
-                    extracted_data.append(row_values)
-                    default_logger.info(f"Extracted data for row {row_idx}: {row_values}")
-
+            with open(uploaded_file_path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                extracted_data = [row for row_idx, row in enumerate(reader, 1) if row_idx >= header_index and any(row)]
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_extension}")
 
-        default_logger.info(f"Total rows extracted: {len(extracted_data)}")
-        default_logger.info(f"Extracted for email: {sendToEmail}")
-
-        # Insert file metadata into database
-        file_id_db = insert_file_db(filename, file_url_s3, sendToEmail, header_index, 2, default_logger)
-
-        # Load extracted data into utb_OfferImport
+        file_id_db = insert_file_db(filename, urls['s3'], sendToEmail, header_index, 2, default_logger)
         load_offer_import_db(extracted_data, file_id_db, default_logger)
 
-        # Send notification email
-        try:
-            await send_file_details_email(
-                to_email=sendToEmail or "nik@luxurymarket.com",
-                file_id=file_id_db,
-                filename=filename,
-                s3_url=file_url_s3,
-                r2_url=file_url_r2,
-                record_count=len(extracted_data),
-                nikoffer_count=0,  # No nikoffer data in this case
-                user_email=sendToEmail or "nik@accessx.com"
-            )
-        except Exception as e:
-            default_logger.error(f"Failed to send notification email: {e}")
-            # Continue despite email failure
-            pass
-
-        return {
-            "success": True,
-            "s3_url": file_url_s3,
-            "r2_url": file_url_r2,
-            "message": "Offer file downloaded and processed successfully",
-            "file_id": file_id_db
-        }
-
+        await send_file_details_email(
+            sendToEmail or "nik@luxurymarket.com", file_id_db, filename,
+            urls['s3'], urls.get('r2'), len(extracted_data), 0, sendToEmail
+        )
+        return {"success": True, "s3_url": urls['s3'], "r2_url": urls.get('r2'), "file_id": file_id_db}
     except Exception as e:
-        default_logger.error(f"Error processing offer file: {e}", exc_info=True)
+        default_logger.error(f"Error in /submitOffer: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
-
     finally:
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
-        if extracted_images_dir and os.path.exists(extracted_images_dir):
-            shutil.rmtree(extracted_images_dir, ignore_errors=True)
-# Endpoint to get details of a specific supplier offer
+
+@app.api_route("/api/update-references", methods=["GET", "POST"], response_model=ReferenceData)
+async def update_references(updated_data: Optional[ReferenceData] = None):
+    """GETs or POSTs a JSON reference file from/to S3."""
+    s3_key = "optimal-references.json"
+    if updated_data is None:  # GET
+        try:
+            s3_client = get_s3_client(service='s3')
+            response = s3_client.get_object(Bucket=S3_CONFIG['bucket_name'], Key=s3_key)
+            data = json.loads(response['Body'].read().decode('utf-8'))
+            return ReferenceData(data=data)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error fetching data: {str(e)}")
+    else:  # POST
+        try:
+            with open("temp_references.json", "w") as f:
+                json.dump(updated_data.data, f)
+            upload_to_s3("temp_references.json", S3_CONFIG["bucket_name"], s3_key, S3_CONFIG['r2_bucket_name'], default_logger)
+            os.remove("temp_references.json")
+            return ReferenceData(data=updated_data.data)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error saving data: {str(e)}")
+
+@app.get("/api/scraping-jobs", response_model=list[JobSummary])
+async def get_all_jobs(page: int = 1, page_size: int = 10):
+    """Retrieves a paginated list of image scraping jobs."""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            offset = (page - 1) * page_size
+            query = """
+                SELECT ID, FileName, CreateFileCompleteTime, UserEmail,
+                    (SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = f.ID) as rec_count,
+                    (SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = f.ID)) as img_count
+                FROM utb_ImageScraperFiles f WHERE FileTypeID = 1 ORDER BY ID DESC
+                OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+            """
+            rows = cursor.execute(query, (offset, page_size)).fetchall()
+            return [JobSummary(**dict(zip([c[0] for c in cursor.description], row))) for row in rows]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/scraping-jobs/{job_id}", response_model=JobDetails)
+async def get_job(job_id: int):
+    """Retrieves detailed information for a specific scraping job."""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT * FROM utb_ImageScraperFiles WHERE ID = ?", (job_id,))
+            job_row = cursor.fetchone()
+            if not job_row: raise HTTPException(status_code=404, detail="Job not found")
+            job_data = dict(zip([c[0] for c in cursor.description], job_row))
+
+            cursor.execute("SELECT * FROM utb_ImageScraperRecords WHERE FileID = ?", (job_id,))
+            records = [dict(zip([c[0] for c in cursor.description], r)) for r in cursor.fetchall()]
+            
+            cursor.execute("SELECT * FROM utb_ImageScraperResult WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?)", (job_id,))
+            results = [dict(zip([c[0] for c in cursor.description], r)) for r in cursor.fetchall()]
+
+            return JobDetails(
+                id=job_data['ID'], inputFile=job_data['FileName'], user=job_data['UserEmail'],
+                imageStart=job_data.get('ImageStartTime'), fileStart=job_data.get('CreateFileStartTime'),
+                fileEnd=job_data.get('CreateFileCompleteTime'), resultFile=job_data.get('FileLocationURLComplete'),
+                fileLocationUrl=job_data.get('FileLocationUrl'), logFileUrl=job_data.get('LogFileURL'),
+                rec=len(records), img=len(results), apiUsed="google-serp", imageEnd=job_data.get('ImageCompleteTime'),
+                results=[ResultItem(**r) for r in results],
+                records=[RecordItem(**r) for r in records]
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/whitelist-domains", response_model=List[DomainAggregation])
+async def get_whitelist_domains():
+    """Aggregates and returns statistics on domains found in scraping results."""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            query = "SELECT ImageSource, SortOrder FROM utb_ImageScraperResult"
+            rows = cursor.execute(query).fetchall()
+            domain_data = {}
+            for row in rows:
+                try:
+                    domain = urllib.parse.urlparse(row.ImageSource).hostname.replace("www.", "") if row.ImageSource else "unknown"
+                except:
+                    domain = "unknown"
+                
+                if domain not in domain_data:
+                    domain_data[domain] = {"totalResults": 0, "positiveSortOrderCount": 0}
+                domain_data[domain]["totalResults"] += 1
+                if row.SortOrder and row.SortOrder > 0:
+                    domain_data[domain]["positiveSortOrderCount"] += 1
+            return [DomainAggregation(domain=d, **data) for d, data in domain_data.items()]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/luxurymarket/supplier/offers", response_model=List[OfferSummary])
+async def list_supplier_offers(page: int = 1, page_size: int = 10):
+    """Lists supplier offers with pagination."""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            offset = (page - 1) * page_size
+            query = """
+                SELECT ID, FileName, FileLocationUrl, UserEmail, CreateFileStartTime,
+                    (SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = f.ID) as record_count,
+                    (SELECT COUNT(*) FROM utb_nikofferloadinitial WHERE FileID = f.ID) as nikoffer_count
+                FROM utb_ImageScraperFiles f WHERE FileTypeID = 2 ORDER BY CreateFileStartTime DESC
+                OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+            """
+            rows = cursor.execute(query, (offset, page_size)).fetchall()
+            return [OfferSummary(**dict(zip([c[0] for c in cursor.description], row))) for row in rows]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/luxurymarket/supplier/offers/{offer_id}", response_model=OfferDetails)
 async def get_supplier_offer(offer_id: int):
-    """
-    Get detailed information about a specific supplier offer, including sample records.
-    """
+    """Gets detailed information about a specific supplier offer."""
     try:
-        default_logger.info(f"Fetching details for supplier offer ID: {offer_id}")
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            query_offer = """
+                SELECT ID, FileName, FileLocationUrl, UserEmail, CreateFileStartTime,
+                    (SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = f.ID) as record_count,
+                    (SELECT COUNT(*) FROM utb_nikofferloadinitial WHERE FileID = f.ID) as nikoffer_count
+                FROM utb_ImageScraperFiles f WHERE ID = ? AND FileTypeID = 2
+            """
+            offer_row = cursor.execute(query_offer, (offer_id,)).fetchone()
+            if not offer_row:
+                raise HTTPException(status_code=404, detail="Supplier offer not found")
+            offer_data = dict(zip([c[0] for c in cursor.description], offer_row))
 
-        # Fetch offer metadata
-        query_offer = """
-            SELECT 
-                ID, 
-                FileName, 
-                FileLocationUrl, 
-                UserEmail, 
-                CreateFileStartTime,
-                (SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = utb_ImageScraperFiles.ID) as record_count,
-                (SELECT COUNT(*) FROM utb_nikofferloadinitial WHERE FileID = utb_ImageScraperFiles.ID) as nikoffer_count
-            FROM utb_ImageScraperFiles
-            WHERE ID = ? AND FileTypeID = 2
-        """
-        cursor.execute(query_offer, (offer_id,))
-        row = cursor.fetchone()
+            cursor.execute("SELECT TOP 5 * FROM utb_ImageScraperRecords WHERE FileID = ? ORDER BY ExcelRowID", (offer_id,))
+            sample_records = [dict(zip([c[0] for c in cursor.description], r)) for r in cursor.fetchall()]
 
-        if not row:
-            default_logger.warning(f"Offer ID {offer_id} not found or not a supplier offer")
-            raise HTTPException(status_code=404, detail="Supplier offer not found")
-
-        # Fetch sample records from utb_ImageScraperRecords (limit to 5 for brevity)
-        query_records = """
-            SELECT TOP 5 
-                EntryID, 
-                ExcelRowID, 
-                ProductModel, 
-                ProductBrand, 
-                ProductColor, 
-                ProductCategory, 
-                ExcelRowImageRef
-            FROM utb_ImageScraperRecords
-            WHERE FileID = ?
-            ORDER BY ExcelRowID
-        """
-        cursor.execute(query_records, (offer_id,))
-        records = cursor.fetchall()
-        sample_records = [
-            {
-                "entryId": r.EntryID,
-                "excelRowId": r.ExcelRowID,
-                "productModel": r.ProductModel,
-                "productBrand": r.ProductBrand,
-                "productColor": r.ProductColor,
-                "productCategory": r.ProductCategory,
-                "excelRowImageRef": r.ExcelRowImageRef
-            }
-            for r in records
-        ]
-
-        # Fetch sample records from utb_nikofferloadinitial (limit to 5 for brevity)
-        query_nikoffers = """
-            SELECT TOP 5 
-                FileID, 
-                f0, f1, f2, f3, f4, 
-                f5, f6, f7, f8, f9
-            FROM utb_nikofferloadinitial
-            WHERE FileID = ?
-            ORDER BY FileID
-        """
-        cursor.execute(query_nikoffers, (offer_id,))
-        nikoffers = cursor.fetchall()
-        sample_nikoffers = [
-            {
-                "fileId": n.FileID,
-                "f0": n.f0,
-                "f1": n.f1,
-                "f2": n.f2,
-                "f3": n.f3,
-                "f4": n.f4,
-                "f5": n.f5,
-                "f6": n.f6,
-                "f7": n.f7,
-                "f8": n.f8,
-                "f9": n.f9
-            }
-            for n in nikoffers
-        ]
-
-        offer_details = OfferDetails(
-            id=row.ID,
-            fileName=row.FileName,
-            fileLocationUrl=row.FileLocationUrl,
-            userEmail=row.UserEmail,
-            createTime=row.CreateFileStartTime.isoformat() if row.CreateFileStartTime else None,
-            recordCount=row.record_count,
-            nikOfferCount=row.nikoffer_count,
-            sampleRecords=sample_records,
-            sampleNikOffers=sample_nikoffers
-        )
-
-        default_logger.info(f"Retrieved details for supplier offer ID: {offer_id}")
-        conn.close()
-        return offer_details
+            cursor.execute("SELECT TOP 5 * FROM utb_nikofferloadinitial WHERE FileID = ? ORDER BY FileID", (offer_id,))
+            sample_nikoffers = [dict(zip([c[0] for c in cursor.description], r)) for r in cursor.fetchall()]
+            
+            return OfferDetails(**offer_data, sampleRecords=sample_records, sampleNikOffers=sample_nikoffers)
     except Exception as e:
-        default_logger.error(f"Error fetching supplier offer {offer_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)
