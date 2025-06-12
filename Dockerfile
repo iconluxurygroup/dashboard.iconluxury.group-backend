@@ -14,13 +14,14 @@ RUN apt-get update && apt-get install -y \
 RUN apt-get update && apt-get install -y \
     gnupg \
     curl \
-    && curl https://packages.microsoft.com/keys/microsoft.asc | tee /etc/apt/trusted.gpg.d/microsoft.asc \
-    && curl https://packages.microsoft.com/config/debian/12/prod.list > /etc/apt/sources.list.d/mssql-release.list \
+    && curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
+    && curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list \
     && apt-get update \
     && apt-get remove -y libodbc2 libodbcinst2 unixodbc-common || true \
     && ACCEPT_EULA=Y apt-get install -y msodbcsql17 unixodbc unixodbc-dev \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
 # Copy requirements first to leverage Docker cache
 COPY requirements.txt .
 

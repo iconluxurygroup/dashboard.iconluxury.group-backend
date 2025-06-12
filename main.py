@@ -413,28 +413,24 @@ def load_payload_db(rows, file_id, column_map, logger=None):
         raise
 
 
-def insert_file_db(filename: str, file_url: str, email: Optional[str], header_index: int, file_type: int, logger=None, icon_distro: bool = False) -> int:
+def insert_file_db(filename: str, file_url: str, email: Optional[str], header_index: int, file_type: int ,logger=None) -> int:
     logger = logger or default_logger
     try:
-        # Set FileTypeID based on icon_distro
-        file_type_id = 3 if icon_distro else file_type
-        logger.info(f"Inserting file record with FileTypeID: {file_type_id}, iconDistro: {icon_distro}")
-
         conn = get_db_connection()
         cursor = conn.cursor()
         query = """
-            INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl, UserEmail, UserHeaderIndex, FileTypeID, CreateFileStartTime)
+            INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl, UserEmail, UserHeaderIndex,FileTypeID, CreateFileStartTime)
             OUTPUT INSERTED.ID
-            VALUES (?, ?, ?, ?, ?, GETDATE())
+            VALUES (?, ?, ?, ?,?, GETDATE())
         """
-        cursor.execute(query, (filename, file_url, email or 'nik@accessx.com', str(header_index), file_type_id))
+        cursor.execute(query, (filename, file_url, email or 'nik@accessx.com', str(header_index),file_type))
         row = cursor.fetchone()
         if row is None or row[0] is None:
             raise Exception("Insert failed or no identity value returned.")
         file_id = int(row[0])
         conn.commit()
         conn.close()
-        logger.info(f"Inserted file record with ID: {file_id}, header_index: {header_index}, FileTypeID: {file_type_id}")
+        logger.info(f"Inserted file record with ID: {file_id} and header_index: {header_index}")
         return file_id
     except pyodbc.Error as e:
         logger.error(f"Database error: {e}")
@@ -787,17 +783,16 @@ async def submit_image(
     CategoryColImage: Optional[str] = Form(None),
     sendToEmail: Optional[str] = Form(None),
     manualBrand: Optional[str] = Form(None),
-    iconDistro: bool = Form(False),  # Added iconDistro form field
 ):
     temp_dir = None
     extracted_images_dir = None
     try:
         file_id = str(uuid.uuid4())
-        default_logger.info(f"Processing file for FileID: {file_id}, iconDistro: {iconDistro}")
+        default_logger.info(f"Processing file for FileID: {file_id}")
         default_logger.info(f"Received: brandColImage={brandColImage}, manualBrand={manualBrand}, "
                            f"searchColImage={searchColImage}, imageColumnImage={imageColumnImage}, "
                            f"ColorColImage={ColorColImage}, CategoryColImage={CategoryColImage}, "
-                           f"header_index={header_index}, iconDistro={iconDistro}")
+                           f"header_index={header_index}")
 
         if header_index < 1:
             raise HTTPException(status_code=400, detail="header_index must be 1 or greater (1-based row number)")
@@ -808,7 +803,7 @@ async def submit_image(
         with open(uploaded_file_path, "wb") as buffer:
             shutil.copyfileobj(fileUploadImage.file, buffer)
 
-        s3_key_excel = f"Uploads/{file_id}/{fileUploadImage.filename}"
+        s3_key_excel = f"uploads/{file_id}/{fileUploadImage.filename}"
         urls = upload_to_s3(
             uploaded_file_path, 
             S3_CONFIG['bucket_name'], 
@@ -817,8 +812,8 @@ async def submit_image(
             logger=default_logger,
             file_id=file_id
         )
-        file_url_s3 = urls['s3']
-        file_url_r2 = urls.get('r2')
+        file_url_s3 = urls['s3']  # S3 URL for database
+        file_url_r2 = urls.get('r2')  # Public R2 URL for response
         default_logger.info(f"Excel file uploaded to S3: {file_url_s3}")
         if file_url_r2:
             default_logger.info(f"Excel file also uploaded to R2: {file_url_r2}")
@@ -843,15 +838,7 @@ async def submit_image(
         default_logger.debug(f"Extracted data: {extracted_data}")
         default_logger.info(f"Extracted for email: {sendToEmail}")
 
-        file_id_db = insert_file_db(
-            fileUploadImage.filename, 
-            file_url_s3, 
-            sendToEmail, 
-            header_index, 
-            file_type=1, 
-            logger=default_logger,
-            icon_distro=iconDistro  # Pass iconDistro to set FileTypeID
-        )
+        file_id_db = insert_file_db(fileUploadImage.filename, file_url_s3, sendToEmail, header_index, 1, default_logger)
 
         load_payload_db(extracted_data, file_id_db, extract_column_map, default_logger)
         try:
@@ -862,11 +849,12 @@ async def submit_image(
                 s3_url=file_url_s3,
                 r2_url=file_url_r2,
                 record_count=len(extracted_data),
-                nikoffer_count=len(extracted_data),
+                nikoffer_count=len(extracted_data),  # Assuming same count for nikoffer
                 user_email=sendToEmail or "nik@accessx.com"
             )
         except Exception as e:
             default_logger.error(f"Failed to send notification email: {e}")
+            # Optionally continue despite email failure
             pass
         return {
             "success": True,
