@@ -897,9 +897,13 @@ def extract_data_and_images(
     header_idx = header_row 
     default_logger.info(f"Processing Excel file with header row: {header_idx}, max_row: {sheet.max_row}")
 
-    # Define valid columns, excluding 'MANUAL' and manualBrand
-    valid_columns = [col for col in column_map.values() if col and col != 'MANUAL' and col != manual_brand]
-    default_logger.debug(f"Valid columns: {valid_columns}")
+    # Define valid columns, excluding 'MANUAL', manualBrand, and non-column entries like 'isIconDistro'
+    # Only include values from the column_map that are actual column letters (e.g., 'A', 'B', 'C')
+    valid_columns = [
+        col for col in column_map.values() 
+        if isinstance(col, str) and col and col != 'MANUAL' and col != manual_brand and re.match(r"^[A-Z]+$", col)
+    ]
+    default_logger.debug(f"Valid columns after filtering: {valid_columns}")
 
     header_data = {
         'search': sheet[f'{column_map["style"]}{header_idx}'].value if column_map.get('style') else None,
@@ -933,8 +937,12 @@ def extract_data_and_images(
         if column_map.get('image'):
             image_cell = f'{column_map["image"]}{row_idx}'
             try:
-                image_ref = sheet[image_cell].value if sheet[image_cell] else None
-                default_logger.debug(f"Image cell {image_cell} value: {image_ref}")
+                # Ensure the image cell reference is valid before attempting to access it
+                if re.match(r"^[A-Z]+$", column_map['image']):
+                    image_ref = sheet[image_cell].value if sheet[image_cell] else None
+                    default_logger.debug(f"Image cell {image_cell} value: {image_ref}")
+                else:
+                    default_logger.warning(f"Skipping invalid image column '{column_map['image']}' in column_map.")
             except ValueError:
                 default_logger.error(f"Invalid image cell reference: {image_cell}")
                 image_ref = None
