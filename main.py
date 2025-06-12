@@ -783,6 +783,7 @@ async def submit_image(
     CategoryColImage: Optional[str] = Form(None),
     sendToEmail: Optional[str] = Form(None),
     manualBrand: Optional[str] = Form(None),
+    isIconDistro: bool = Form(False, description="Is this an icon distribution file? (default: False)")
 ):
     temp_dir = None
     extracted_images_dir = None
@@ -824,7 +825,8 @@ async def submit_image(
             'image': validate_column(imageColumnImage) if imageColumnImage else None,
             'color': validate_column(ColorColImage) if ColorColImage else None,
             'category': validate_column(CategoryColImage) if CategoryColImage else None,
-            'manualBrand': manualBrand
+            'manualBrand': manualBrand,
+            'isIconDistro':isIconDistro,
         }
         default_logger.info(f"Column map: {extract_column_map}")
 
@@ -837,8 +839,12 @@ async def submit_image(
         )
         default_logger.debug(f"Extracted data: {extracted_data}")
         default_logger.info(f"Extracted for email: {sendToEmail}")
+        if isIconDistro:
+            file_type = 3  # Icon distribution file type
+        else:
+            file_type = 1
 
-        file_id_db = insert_file_db(fileUploadImage.filename, file_url_s3, sendToEmail, header_index, 1, default_logger)
+        file_id_db = insert_file_db(fileUploadImage.filename, file_url_s3, sendToEmail, header_index, file_type, default_logger)
 
         load_payload_db(extracted_data, file_id_db, extract_column_map, default_logger)
         try:
