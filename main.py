@@ -783,7 +783,7 @@ async def submit_image(
     CategoryColImage: Optional[str] = Form(None),
     sendToEmail: Optional[str] = Form(None),
     manualBrand: Optional[str] = Form(None),
-    isIconDistro: bool = Form(None)
+    isIconDistro: bool = Form(...)
 ):
     temp_dir = None
     extracted_images_dir = None
