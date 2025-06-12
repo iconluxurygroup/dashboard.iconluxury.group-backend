@@ -783,7 +783,7 @@ async def submit_image(
     CategoryColImage: Optional[str] = Form(None),
     sendToEmail: Optional[str] = Form(None),
     manualBrand: Optional[str] = Form(None),
-    isIconDistro: bool = Form(False, description="Is this an icon distribution file? (default: False)")
+    isIconDistro: bool = Form(None)
 ):
     temp_dir = None
     extracted_images_dir = None
@@ -839,7 +839,7 @@ async def submit_image(
         )
         default_logger.debug(f"Extracted data: {extracted_data}")
         default_logger.info(f"Extracted for email: {sendToEmail}")
-        if extract_column_map["isIconDistro"]:
+        if isIconDistro:
             file_type = 3  # Icon distribution file type
         else:
             file_type = 1
