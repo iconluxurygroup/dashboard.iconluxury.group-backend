@@ -839,7 +839,7 @@ async def submit_image(
         )
         default_logger.debug(f"Extracted data: {extracted_data}")
         default_logger.info(f"Extracted for email: {sendToEmail}")
-        if isIconDistro:
+        if extract_column_map["isIconDistro"]:
             file_type = 3  # Icon distribution file type
         else:
             file_type = 1
