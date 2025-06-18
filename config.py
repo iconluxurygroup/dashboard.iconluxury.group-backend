@@ -24,18 +24,18 @@ S3_CONFIG = {
     "access_key": "AKIA2CUNLEV6V627SWI7",
     "secret_key": "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",
     "bucket_name": "iconluxurygroup",
-    "r2_endpoint": "https://aa2f6aae69e7fb4bd8e2cd4311c411cb.r2.cloudflarestorage.com",
-    "r2_access_key": "8b5a4a988c474205e0172eab5479d6f2",
-    "r2_secret_key": "8ff719bbf2946c1b6a81fcf2121e1a41604a0b6f2890f308871b381e98a8d725",
-    "r2_account_id": "aa2f6aae69e7fb4bd8e2cd4311c411cb",
+    "r2_endpoint": "https://97d91ece470eb7b9aa71ca0c781cfacc.r2.cloudflarestorage.com",
+    "r2_access_key": "5547ff7ffb8f3b16a15d6f38322cd8bd",
+    "r2_secret_key": "771014b01093eceb212dfea5eec0673842ca4a39456575ca7ff43f768cf42978",
+    "r2_account_id": "97d91ece470eb7b9aa71ca0c781cfacc",
     "r2_bucket_name": "iconluxurygroup",
-    "r2_custom_domain": "https://iconluxury.group",
+    "r2_custom_domain": "https://iconluxury.shop"
 }
 
 DB_PASSWORD=  'Ftu5675FDG54hjhiuu$'
 
 # Existing imports and conn_str
-BASE_CONFIG_URL = "https://iconluxury.group/static_settings/"
+BASE_CONFIG_URL = "https://iconluxury.shop/static_settings/"
 # Grok API settings for image processing
 GROK_API_KEY = os.getenv('GROK_API_KEY', 'xai-ucA8EcERzruUwHAa1duxYallTxycDumI5n3eVY7EJqhZVD0ywiiza3zEmRB4Tw7eNC5k0VuXVndYOUj9')
 GROK_ENDPOINT = os.getenv('GROK_ENDPOINT', 'https://api.x.ai/v1/chat/completions')
