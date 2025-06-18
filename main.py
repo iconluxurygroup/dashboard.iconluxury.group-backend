@@ -809,9 +809,8 @@ async def submit_image(
 
         if extract_column_map['brand'] == 'MANUAL' and not manualBrand:
             raise HTTPException(status_code=400, detail="manualBrand is required when brandColImage is 'MANUAL'")
-        data_start_row = header_index + 1
         extracted_data, extracted_images_dir = extract_data_and_images(
-            uploaded_file_path, file_id, extract_column_map, data_start_row,
+            uploaded_file_path, file_id, extract_column_map, header_index,
             manualBrand if extract_column_map['brand'] == 'MANUAL' else None
         )
         default_logger.debug(f"Extracted data: {extracted_data}")
