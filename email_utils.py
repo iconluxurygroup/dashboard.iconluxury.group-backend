@@ -3,7 +3,7 @@ import logging
 import aiosmtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from config import SENDER_EMAIL, SENDER_PASSWORD, SENDER_NAME, VERSION
+from config import SENDER_EMAIL, SENDER_PASSWORD, SENDER_NAME, VERSION 
 
 # Module-level logger
 default_logger = logging.getLogger(__name__)
@@ -17,14 +17,24 @@ if not default_logger.handlers:
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
-async def send_message_email(to_emails, subject, message, logger=None):
-    """Send a plain message email (e.g., for errors) using Gmail SMTP.
+async def send_file_details_email(to_emails, subject, file_details_content, logger=None):
+    """Send an email with file details using Gmail SMTP.
 
-    Version: 3.0.4
+    Args:
+        to_emails (str or list): The recipient email address(es). Can be a single string or a list of strings.
+        subject (str): The subject line of the email.
+        file_details_content (str): The main content of the email, containing the file details.
+        logger (logging.Logger, optional): A custom logger instance. Defaults to the module's default logger.
+
+    Returns:
+        bool: True if the email was sent successfully, False otherwise.
+
+    Raises:
+        Exception: If an unexpected error occurs during the email sending process.
     """
     logger = logger or default_logger
     try:
-        # Handle string or list input for to_emails
+        # Normalize to_emails into a list of valid email addresses
         if isinstance(to_emails, str):
             email_list = [to_emails]
         else:
@@ -35,32 +45,30 @@ async def send_message_email(to_emails, subject, message, logger=None):
                 else:
                     email_list.append(item)
         
-        # Validate email addresses
         valid_emails = [email for email in email_list if isinstance(email, str) and '@' in email]
         if not valid_emails:
-            logger.error("No valid email addresses provided")
+            logger.error("No valid email addresses provided for file details email.")
             return False
 
-        # Create MIME message
+        # Create the MIME message
         msg = MIMEMultipart()
         msg['From'] = f'{SENDER_NAME} <{SENDER_EMAIL}>'
         msg['To'] = ', '.join(valid_emails)
-        # Add the subject here
-        msg['Subject'] = subject 
+        msg['Subject'] = subject # Set the email subject
         
-        # Set CC recipient
+        # Determine CC recipient
         cc_recipient = 'nik@iconluxurygroup.com' if 'nik@luxurymarket.com' not in valid_emails else 'nik@luxurymarket.com'
         msg['Cc'] = cc_recipient
 
-        # HTML content
-        message_with_breaks = message.replace("\n", "<br>")
+        # Prepare HTML content for the email body
+        file_details_with_breaks = file_details_content.replace("\n", "<br>")
         html_content = f"""
         <html>
         <body>
         <div class="container">
-            <p>Message details:<br>{message_with_breaks}</p>
+            <p>File details:<br>{file_details_with_breaks}</p>
             <p>--</p>
-            <p><small>This is an automated notification.<br>
+            <p><small>This is an automated notification regarding file details.<br>
             Version: <a href="https://dashboard.iconluxury.group">{VERSION}</a>
             <br>
             User: {', '.join(valid_emails)}</small></p>
@@ -70,21 +78,23 @@ async def send_message_email(to_emails, subject, message, logger=None):
         """
         msg.attach(MIMEText(html_content, 'html'))
 
-        # Connect and send email
+        # Connect to SMTP server and send the email
         smtp_client = aiosmtplib.SMTP(
             hostname=SMTP_SERVER,
             port=SMTP_PORT,
-            use_tls=False,
-            start_tls=True
+            use_tls=False, # We'll start TLS explicitly
+            start_tls=True # Initiate STARTTLS
         )
         await smtp_client.connect()
         await smtp_client.login(SENDER_EMAIL, SENDER_PASSWORD)
+        
+        # Combine To and Cc recipients for sending
         recipients = valid_emails + [cc_recipient]
         await smtp_client.send_message(msg, sender=SENDER_EMAIL, recipients=recipients)
         await smtp_client.quit()
 
-        logger.info(f"📧 Message email sent successfully to {', '.join(valid_emails)} with subject: {subject}")
+        logger.info(f"📧 File details email sent successfully to {', '.join(valid_emails)} with subject: '{subject}'.")
         return True
     except Exception as e:
-        logger.error(f"🔴 Error sending message email to {to_emails}: {e}", exc_info=True)
+        logger.error(f"🔴 Error sending file details email to {to_emails} with subject '{subject}': {e}", exc_info=True)
         raise

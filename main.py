@@ -23,7 +23,7 @@ from typing import List, Optional
 import pyodbc
 from datetime import datetime
 from config import VERSION, S3_CONFIG, DB_CONFIG
-from email_utils import send_message_email
+from email_utils import send_file_details_email
 # Assuming this code is part of the existing FastAPI app
 # If it's a separate module, ensure the app is imported or instantiated
 # Initialize FastAPI app
@@ -231,75 +231,6 @@ def upload_to_s3(local_file_path, bucket_name, s3_key, r2_bucket_name=None, logg
     return result_urls
 
 
-import aiohttp
-from fastapi import HTTPException
-from datetime import datetime
-
-async def send_file_details_email(
-    to_email: str,
-    file_id: int,
-    filename: str,
-    s3_url: str,
-    r2_url: str | None,
-    record_count: int,
-    nikoffer_count: int,
-    user_email: str | None
-) -> bool:
-    try:
-        subject = f"File Upload Notification - File ID: {file_id}"
-        
-        # Construct the restart job URL
-        restart_job_url = f"https://icon7-8080.iconluxury.today/api/v4/restart-search-all/{file_id}"
-        
-        # Construct the email message with file details and restart job link
-        message = (
-            "File Upload Notification\n"
-            f"File ID: {file_id}\n"
-            f"File Name: {filename}\n"
-            f"S3 URL: {s3_url}\n"
-            f"R2 URL: {r2_url or 'Not available'}\n"
-            f"Upload Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"Records Processed: {record_count}\n"
-            f"Nikoffer Records Processed: {nikoffer_count}\n"
-            f"Uploaded By: {user_email or 'Unknown'}\n"
-            f"Environment: iconluxury.group\n"
-            f"Version: {VERSION}\n"
-        )
-        
-        default_logger.info(f"Preparing to send email to {to_email} with subject: {subject}")
-        
-        # Send the POST request to restart the search job
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                restart_job_url,
-                headers={"accept": "application/json"}
-            ) as response:
-                if response.status == 200:
-                    default_logger.info(f"Successfully triggered restart search job for file ID {file_id}")
-                else:
-                    default_logger.error(f"Failed to trigger restart search job for file ID {file_id}: {response.status}")
-                    # Optionally, you could raise an exception or continue without failing the email
-                    # raise HTTPException(status_code=500, detail=f"Failed to trigger restart job: {response.status}")
-
-        # Send the email using the provided send_message_email function
-        success = await send_message_email(
-            to_emails=to_email,
-            subject=subject,
-            message=message,
-            logger=default_logger
-        )
-        
-        if success:
-            default_logger.info(f"Email sent successfully to {to_email}")
-            return True
-        else:
-            default_logger.error(f"Failed to send email to {to_email}")
-            return False
-            
-    except Exception as e:
-        default_logger.error(f"Error sending file details email to {to_email}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
-
 
 def validate_column(col: str) -> str:
     if not col or not re.match(r"^[A-Z]+$", col):
@@ -484,163 +415,6 @@ def load_nikoffer_db(rows, file_id, headers=None, logger=None):
         logger.error(f"Error loading nikoffer data: {e}")
         raise
 
-# Updated /submitFullFile endpoint for dynamic file uploads
-@app.post("/submitFullFile")
-async def submit_full_file(
-    fileUpload: UploadFile,
-    header_index: int = Form(...),
-    sendToEmail: Optional[str] = Form(None),
-):
-    temp_dir = None
-    extracted_images_dir = None
-    try:
-        file_id = str(uuid.uuid4())
-        default_logger.info(f"Processing full file for FileID: {file_id}")
-        default_logger.info(f"Received: header_index={header_index}, sendToEmail={sendToEmail}")
-
-        if header_index < 1:
-            raise HTTPException(status_code=400, detail="header_index must be 1 or greater (1-based row number)")
-
-        # Create temporary directory for file processing
-        temp_dir = os.path.join("temp_files", "full_files", file_id)
-        os.makedirs(temp_dir, exist_ok=True)
-        uploaded_file_path = os.path.join(temp_dir, fileUpload.filename)
-        with open(uploaded_file_path, "wb") as buffer:
-            shutil.copyfileobj(fileUpload.file, buffer)
-
-        upload_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        # Upload file to S3 and R2
-        s3_key_excel = f"luxurymarket/supplier/offer/{upload_timestamp}/{file_id}/{fileUpload.filename}"
-        urls = upload_to_s3(
-            uploaded_file_path,
-            S3_CONFIG['bucket_name'],
-            s3_key_excel,
-            r2_bucket_name=S3_CONFIG['r2_bucket_name'],
-            logger=default_logger,
-            file_id=file_id
-        )
-        file_url_s3 = urls['s3']  # S3 URL for database
-        file_url_r2 = urls.get('r2')  # Public R2 URL for response
-        default_logger.info(f"File uploaded to S3: {file_url_s3}")
-        if file_url_r2:
-            default_logger.info(f"File also uploaded to R2: {file_url_r2}")
-
-        # Determine file type and extract data
-        extracted_data = []
-        headers = []
-        file_extension = os.path.splitext(fileUpload.filename)[1].lower()
-
-        if file_extension in ['.xlsx', '.xls']:
-            # Process Excel file
-            wb = load_workbook(uploaded_file_path)
-            sheet = wb.active
-            image_loader = SheetImageLoader(sheet)
-
-            default_logger.info(f"Processing Excel file with header row: {header_index}, max_row: {sheet.max_row}")
-
-            # Get headers
-            for col in sheet[header_index]:
-                headers.append(str(col.value) if col.value else f"Column_{col.column}")
-            default_logger.debug(f"Headers: {headers}")
-
-            # Extract data and images
-            for row_idx in range(header_index + 1, sheet.max_row + 1):
-                default_logger.debug(f"Processing row {row_idx}")
-                row_values = [sheet.cell(row=row_idx, column=col_idx).value for col_idx in range(1, len(headers) + 1)]
-                if all(val is None for val in row_values):
-                    default_logger.info(f"Skipping empty row {row_idx}")
-                    continue
-
-                data = {header: value for header, value in zip(headers, row_values)}
-                
-                # Check for images in first column (Picture)
-                cell_ref = f"A{row_idx}"
-                extracted_images_dir = os.path.join("temp_files", "extracted_images", file_id)
-                os.makedirs(extracted_images_dir, exist_ok=True)
-                if image_loader.image_in(cell_ref):
-                    img_path = os.path.join(extracted_images_dir, f"image_{file_id}_{cell_ref}.png")
-                    image = image_loader.get(cell_ref)
-                    if image:
-                        image.save(img_path)
-                        s3_key = f"images/{file_id}/{os.path.basename(img_path)}"
-                        img_urls = upload_to_s3(
-                            img_path,
-                            S3_CONFIG['bucket_name'],
-                            s3_key,
-                            r2_bucket_name=S3_CONFIG['r2_bucket_name'],
-                            logger=default_logger,
-                            file_id=file_id
-                        )
-                        image_col = next((h for h in headers if 'image' in h.lower()), 'ExcelRowImageRef')
-                        data[image_col] = img_urls['s3']
-                        default_logger.info(f"Extracted and uploaded image from {cell_ref} to S3: {img_urls['s3']}")
-                        if 'r2' in img_urls:
-                            default_logger.info(f"Image also uploaded to R2: {img_urls['r2']}")
-
-                extracted_data.append(data)
-                default_logger.info(f"Extracted data for row {row_idx}: {data}")
-
-        elif file_extension == '.csv':
-            # Process CSV file
-            df = pd.read_csv(uploaded_file_path, header=header_index - 1, encoding='utf-8', low_memory=False)
-            df = df.where(pd.notnull(df), None)  # Convert NaN to None
-            headers = [str(col) if col else f"Column_{i+1}" for i, col in enumerate(df.columns)]
-            default_logger.debug(f"Headers: {headers}")
-
-            for idx, row in df.iterrows():
-                if all(val is None for val in row):
-                    default_logger.info(f"Skipping empty row {idx + header_index}")
-                    continue
-                data = {header: row[col] for header, col in zip(headers, df.columns)}
-                extracted_data.append(data)
-                default_logger.info(f"Extracted data for row {idx + header_index}: {data}")
-
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_extension}")
-
-        default_logger.info(f"Total rows extracted (excluding header): {len(extracted_data)}")
-        default_logger.info(f"Extracted for email: {sendToEmail}")
-
-        # Insert file metadata into database
-        file_id_db = insert_file_db(fileUpload.filename, file_url_s3, sendToEmail, header_index, 2, default_logger)
-
-        # Load extracted data into utb_ImageScraperRecords
-        column_map = infer_column_map(extracted_data)
-        load_payload_db(extracted_data, file_id_db, column_map, default_logger)
-
-        # Load extracted data into utb_nikofferloadinitial
-        load_nikoffer_db(extracted_data, file_id_db, headers, default_logger)
-        try:
-            await send_file_details_email(
-                to_email=sendToEmail or "nik@luxurymarket.com",
-                file_id=file_id_db,
-                filename=fileUpload.filename,
-                s3_url=file_url_s3,
-                r2_url=file_url_r2,
-                record_count=len(extracted_data),
-                nikoffer_count=len(extracted_data),  # Assuming same count for nikoffer
-                user_email=sendToEmail or "nik@accessx.com"
-            )
-        except Exception as e:
-            default_logger.error(f"Failed to send notification email: {e}")
-            # Optionally continue despite email failure
-            pass
-        return {
-            "success": True,
-            "s3_url": file_url_s3,
-            "r2_url": file_url_r2,
-            "message": "File uploaded and processed successfully",
-            "file_id": file_id_db
-        }
-    except Exception as e:
-        default_logger.error(f"Error processing file: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
-    finally:
-        if temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        if extracted_images_dir and os.path.exists(extracted_images_dir):
-            shutil.rmtree(extracted_images_dir, ignore_errors=True)
-
 
 def infer_column_map(extracted_data: List[Dict]) -> Dict[str, str]:
     """
@@ -768,9 +542,9 @@ async def submit_image(
         file_id = str(uuid.uuid4())
         default_logger.info(f"Processing file for FileID: {file_id}")
         default_logger.info(f"Received: brandColImage={brandColImage}, manualBrand={manualBrand}, "
-                           f"searchColImage={searchColImage}, imageColumnImage={imageColumnImage}, "
-                           f"ColorColImage={ColorColImage}, CategoryColImage={CategoryColImage}, "
-                           f"header_index={header_index}")
+                             f"searchColImage={searchColImage}, imageColumnImage={imageColumnImage}, "
+                             f"ColorColImage={ColorColImage}, CategoryColImage={CategoryColImage}, "
+                             f"header_index={header_index}")
 
         if header_index < 1:
             raise HTTPException(status_code=400, detail="header_index must be 1 or greater (1-based row number)")
@@ -823,21 +597,33 @@ async def submit_image(
         file_id_db = insert_file_db(fileUploadImage.filename, file_url_s3, sendToEmail, header_index, file_type, default_logger)
 
         load_payload_db(extracted_data, file_id_db, extract_column_map, default_logger)
+        
+        # --- START UPDATED SECTION ---
+        # Construct the subject for the email
+        email_subject = f"Image Scraper Report: {fileUploadImage.filename}"
+
+        # Construct the detailed message content for the email body
+        email_content = f"""
+File ID: {file_id_db}
+Filename: {fileUploadImage.filename}
+S3 URL: {file_url_s3}
+R2 URL: {file_url_r2}
+Record Count: {len(extracted_data)}
+Nikoffer Count: {len(extracted_data)}
+User Email: {sendToEmail or "nik@accessx.com"}
+"""
         try:
             await send_file_details_email(
-                to_email=sendToEmail or "nik@luxurymarket.com",
-                file_id=file_id_db,
-                filename=fileUploadImage.filename,
-                s3_url=file_url_s3,
-                r2_url=file_url_r2,
-                record_count=len(extracted_data),
-                nikoffer_count=len(extracted_data),  # Assuming same count for nikoffer
-                user_email=sendToEmail or "nik@accessx.com"
+                to_emails=sendToEmail or "nik@luxurymarket.com",
+                subject=email_subject, # Pass the constructed subject
+                file_details_content=email_content # Pass the constructed content
             )
         except Exception as e:
             default_logger.error(f"Failed to send notification email: {e}")
             # Optionally continue despite email failure
             pass
+        # --- END UPDATED SECTION ---
+
         return {
             "success": True,
             "s3_url": file_url_s3,
@@ -853,7 +639,7 @@ async def submit_image(
             shutil.rmtree(temp_dir, ignore_errors=True)
         if extracted_images_dir and os.path.exists(extracted_images_dir):
             shutil.rmtree(extracted_images_dir, ignore_errors=True)
-
+            
 def extract_data_and_images(
     file_path: str, 
     file_id: str, 
