@@ -600,7 +600,7 @@ async def submit_image(
         
         # --- START UPDATED SECTION ---
         # Construct the subject for the email
-        email_subject = f"Image Scraper Report: {fileUploadImage.filename}"
+        email_subject = f"Image Scraper Report: {file_id_db} {fileUploadImage.filename}"
 
         # Construct the detailed message content for the email body
         email_content = f"""
