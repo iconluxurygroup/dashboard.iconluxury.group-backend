@@ -18,6 +18,15 @@ BRAND_RULES_URL = "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon
 AWS_ACCESS_KEY_ID ='AKIA2CUNLEV6V627SWI7'
 AWS_SECRET_ACCESS_KEY = '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'
 REGION = "us-east-2"
+# MSSQL connection settings
+DB_CONFIG = {
+    "server": "35.172.243.170",
+    "database": "luxurymarket_p4",
+    "username": "luxurysitescraper",
+    "password": "Ftu5675FDG54hjhiuu$",
+    "driver": "{ODBC Driver 17 for SQL Server}",
+}
+
 S3_CONFIG = {
     "endpoint": "https://s3.us-east-2.amazonaws.com",
     "region": "us-east-2",

@@ -22,7 +22,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 import pyodbc
 from datetime import datetime
-from config import VERSION
+from config import VERSION, S3_CONFIG, DB_CONFIG
 from email_utils import send_message_email
 # Assuming this code is part of the existing FastAPI app
 # If it's a separate module, ensure the app is imported or instantiated
@@ -118,29 +118,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# MSSQL connection settings
-DB_CONFIG = {
-    "server": "35.172.243.170",
-    "database": "luxurymarket_p4",
-    "username": "luxurysitescraper",
-    "password": "Ftu5675FDG54hjhiuu$",
-    "driver": "{ODBC Driver 17 for SQL Server}",
-}
-
-# AWS S3 and Cloudflare R2 configuration
-S3_CONFIG = {
-    "endpoint": "https://s3.us-east-2.amazonaws.com",
-    "region": "us-east-2",
-    "access_key": "AKIA2CUNLEV6V627SWI7",
-    "secret_key": "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",
-    "bucket_name": "iconluxurygroup",
-    "r2_endpoint": "https://aa2f6aae69e7fb4bd8e2cd4311c411cb.r2.cloudflarestorage.com",
-    "r2_access_key": "8b5a4a988c474205e0172eab5479d6f2",
-    "r2_secret_key": "8ff719bbf2946c1b6a81fcf2121e1a41604a0b6f2890f308871b381e98a8d725",
-    "r2_account_id": "aa2f6aae69e7fb4bd8e2cd4311c411cb",
-    "r2_bucket_name": "iconluxurygroup",
-    "r2_custom_domain": "https://iconluxury.group",
-}
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
