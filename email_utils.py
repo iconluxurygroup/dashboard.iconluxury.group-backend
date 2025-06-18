@@ -45,6 +45,8 @@ async def send_message_email(to_emails, subject, message, logger=None):
         msg = MIMEMultipart()
         msg['From'] = f'{SENDER_NAME} <{SENDER_EMAIL}>'
         msg['To'] = ', '.join(valid_emails)
+        # Add the subject here
+        msg['Subject'] = subject 
         
         # Set CC recipient
         cc_recipient = 'nik@iconluxurygroup.com' if 'nik@luxurymarket.com' not in valid_emails else 'nik@luxurymarket.com'
@@ -81,7 +83,7 @@ async def send_message_email(to_emails, subject, message, logger=None):
         await smtp_client.send_message(msg, sender=SENDER_EMAIL, recipients=recipients)
         await smtp_client.quit()
 
-        logger.info(f"📧 Message email sent successfully to {', '.join(valid_emails)}")
+        logger.info(f"📧 Message email sent successfully to {', '.join(valid_emails)} with subject: {subject}")
         return True
     except Exception as e:
         logger.error(f"🔴 Error sending message email to {to_emails}: {e}", exc_info=True)
